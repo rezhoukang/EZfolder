@@ -63,14 +63,18 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static constexpr UINT refreshMessage = WM_APP + 28;
     static constexpr UINT separateMessage = WM_APP + 29;
     static constexpr UINT shortcutMessage = WM_APP + 30;
-    HHOOK focusedKeys = nullptr;
-    inline static thread_local Band* focusedBand = nullptr;
+    bool watchingKeys = false;
+    Band* nextOnThread = nullptr;
+    inline static thread_local HHOOK threadKeys = nullptr;
+    inline static thread_local Band* threadBands = nullptr;
     HWND incoming = nullptr;
     HWND awaitingAck = nullptr;
     LPARAM incomingBirth = 0;
     int importIndex = -1;
     bool settled = false, offered = false;
     ULONGLONG opened = 0;
+    HWND foregroundAtOpen = nullptr;
+    DWORD inputAtOpen = 0;
     Location offeredFolder;
     merge::LocalOffer localOffer;
     std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> offeredName{nullptr,CoTaskMemFree};
@@ -137,10 +141,21 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
         auto now = GetTickCount64();
         MergeVisibility::stored(bar,now);
+        HWND foreground = GetForegroundWindow();
+        LASTINPUTINFO input{sizeof(input),0};
+        if (foreground == merge::frame(source) || (foreground && foreground == GetPropW(source,merge::foregroundProp) &&
+            GetLastInputInfo(&input) && ULONG_PTR(input.dwTime)+1 == reinterpret_cast<ULONG_PTR>(GetPropW(source,merge::inputProp)))) {
+            HWND root = merge::frame(bar);
+            if (IsIconic(root)) ShowWindow(root,SW_RESTORE);
+            if (foreground != root) SetForegroundWindow(root);
+        }
+        bool single = nextImported < 0 && !MergeVisibility::pending(bar,merge::frame(source));
         if (nextImported < 0) firstImportedAt = now;
         nextImported = index;
-        activateAfter = now+120;
+        activateAfter = single ? now : now+120;
         schedule(25);
+        if (single && destination < 0 && (!awaitingAck || GetPropW(awaitingAck,merge::offerProp) != bar))
+            select(index);
         return true;
     }
     void endImport(bool success) {
@@ -239,6 +254,12 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
         if (!SetPropW(bar, merge::offerProp, host)) { settle(); return; }
         if (modern) {
+            // The shell may have granted the new Explorer process foreground rights.
+            // Share those rights only with the Explorer process receiving this open.
+            DWORD targetPid = 0;
+            GetWindowThreadProcessId(host,&targetPid);
+            if (targetPid && targetPid != GetCurrentProcessId() && shouldActivate(merge::frame(bar)))
+                AllowSetForegroundWindow(targetPid);
             offered = PostMessageW(host,merge::storeTab(),reinterpret_cast<WPARAM>(bar),birth) != FALSE;
             if (!offered) RemovePropW(bar,merge::offerProp);
             return;
@@ -274,13 +295,21 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         closingMergedFrame = true;
         settle();
         HWND target = merge::frame(host);
-        if (IsIconic(target)) ShowWindowAsync(target, SW_RESTORE);
-        if (GetForegroundWindow() == root) SetForegroundWindow(target);
+        if (target && shouldActivate(root)) {
+            if (IsIconic(target)) ShowWindowAsync(target, SW_RESTORE);
+            if (GetForegroundWindow() != target) SetForegroundWindow(target);
+        }
         if (!PostMessageW(root, WM_CLOSE, 0, 0)) presentation.finish();
     }
     bool validSourceAck(HWND host, LPARAM birth) const {
         return !GetPropW(merge::frame(bar), merge::keepFrame) && merge::live(host) && merge::live(bar) && GetPropW(bar, merge::offerProp) == host &&
             reinterpret_cast<LPARAM>(GetPropW(bar, merge::birthProp)) == birth;
+    }
+    bool shouldActivate(HWND source) const {
+        HWND foreground = GetForegroundWindow();
+        LASTINPUTINFO input{sizeof(input),0};
+        return foreground == source || (foreground == foregroundAtOpen &&
+            GetLastInputInfo(&input) && input.dwTime == inputAtOpen);
     }
     void tick() {
         const auto now = GetTickCount64();
@@ -660,7 +689,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
     }
     int shortcutFor(WPARAM vk) const {
-        if (separating >= 0 || ((GetKeyState(VK_LWIN)|GetKeyState(VK_RWIN)) & 0x8000)) return -1;
+        if ((GetKeyState(VK_LWIN)|GetKeyState(VK_RWIN)) & 0x8000) return -1;
         DWORD chord = static_cast<DWORD>(vk);
         if (GetKeyState(VK_CONTROL) & 0x8000) chord |= settings::control;
         if (GetKeyState(VK_SHIFT) & 0x8000) chord |= settings::shift;
@@ -679,22 +708,29 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         } else return false;
         return true;
     }
-    // Explorer translates accelerators such as F6 before DispatchMessage. Only route
-    // matching keydowns addressed to our own focused child on this UI thread.
+    // Explorer translates Ctrl+W before dispatching to the folder view. Resolve
+    // the owning band from the actual message window, even on a shared UI thread.
     static LRESULT CALLBACK focusedMessage(int code,WPARAM mode,LPARAM data) {
         if (code==HC_ACTION && mode==PM_REMOVE) {
             auto* msg=reinterpret_cast<MSG*>(data);
-            if ((msg->message==WM_KEYDOWN || msg->message==WM_SYSKEYDOWN) && focusedBand &&
-                (msg->hwnd==focusedBand->tabs || msg->hwnd==focusedBand->add) && msg->hwnd==GetFocus()) {
-                int action=focusedBand->shortcutFor(msg->wParam);
-                if (action>=0) { msg->message=shortcutMessage; msg->wParam=action; }
+            if ((msg->message==WM_KEYDOWN || msg->message==WM_SYSKEYDOWN) && msg->hwnd && msg->hwnd==GetFocus()) {
+                HWND root = GetAncestor(msg->hwnd,GA_ROOT);
+                HWND band = static_cast<HWND>(GetPropW(root,merge::bandProp));
+                if (root==GetForegroundWindow() && band && IsWindowVisible(band) && IsWindowEnabled(root)) {
+                    auto* self = threadBands;
+                    while (self && self->bar != band) self = self->nextOnThread;
+                    if (!self) return CallNextHookEx(nullptr,code,mode,data);
+                    int action = self->shortcutFor(msg->wParam);
+                    if (action==settings::Close || (action>=0 && (msg->hwnd==self->tabs || msg->hwnd==self->add))) {
+                        bool repeatClose = action==settings::Close && (msg->lParam & (1L<<30));
+                        msg->hwnd=band;
+                        msg->message=repeatClose ? WM_NULL : shortcutMessage;
+                        msg->wParam=action;
+                    }
+                }
             }
         }
         return CallNextHookEx(nullptr,code,mode,data);
-    }
-    void releaseFocusedKeys() {
-        if (focusedBand==this) focusedBand=nullptr;
-        if (focusedKeys) { UnhookWindowsHookEx(focusedKeys); focusedKeys=nullptr; }
     }
     static LRESULT CALLBACK childProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
@@ -720,13 +756,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 self->closeTab(TabCtrl_HitTest(w, &hit));
                 return 0;
             }
-            if (msg==shortcutMessage) { if (w==GetFocus()) self->runShortcut(static_cast<int>(wp)); return 0; }
             if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && self->runShortcut(self->shortcutFor(wp))) return 0;
-            if (msg==WM_KILLFOCUS || msg==WM_NCDESTROY) self->releaseFocusedKeys();
-            if (msg==WM_SETFOCUS && !self->focusedKeys) {
-                self->focusedKeys=SetWindowsHookExW(WH_GETMESSAGE,focusedMessage,nullptr,GetCurrentThreadId());
-                if (self->focusedKeys) focusedBand=self;
-            }
             if ((msg == WM_SETFOCUS || msg == WM_KILLFOCUS) && self->site.p) {
                 Com<IInputObjectSite> input;
                 if (SUCCEEDED(self->site->QueryInterface(IID_PPV_ARGS(&input.p))))
@@ -738,6 +768,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static LRESULT CALLBACK barProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
         try {
+            if (msg==shortcutMessage) {
+                if (IsWindowVisible(w) && merge::frame(w)==GetForegroundWindow()) self->runShortcut(static_cast<int>(wp));
+                return 0;
+            }
             if (msg == WM_COPYDATA && lp) return self->matchesOffer(reinterpret_cast<HWND>(wp),*reinterpret_cast<COPYDATASTRUCT*>(lp));
             if (msg == merge::storeTab() || msg == merge::storedTab()) {
                 Com<IDeskBand> guard;
@@ -829,6 +863,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                               0, 0, 0, 0, parent, nullptr, module, nullptr);
         if (!bar || !SetWindowSubclass(bar, barProc, 1, reinterpret_cast<DWORD_PTR>(this))) return E_FAIL;
         opened = GetTickCount64();
+        foregroundAtOpen = GetForegroundWindow();
+        LASTINPUTINFO input{sizeof(input),0};
+        inputAtOpen = GetLastInputInfo(&input) ? input.dwTime : 0;
+        if (foregroundAtOpen) SetPropW(bar,merge::foregroundProp,foregroundAtOpen);
+        SetPropW(bar,merge::inputProp,reinterpret_cast<HANDLE>(ULONG_PTR(inputAtOpen)+1));
         HWND root = merge::frame(bar);
         settled = !root || GetPropW(root, merge::keepFrame);
         offered = false;
@@ -836,6 +875,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         SetPropW(bar, merge::birthProp, reinterpret_cast<HANDLE>(opened + 1));
         SetPropW(bar,settled ? merge::readyProp : merge::startingProp,reinterpret_cast<HANDLE>(1));
         if (root) SetPropW(root, merge::bandProp, bar);
+        if (root) {
+            if (!threadKeys) threadKeys=SetWindowsHookExW(WH_GETMESSAGE,focusedMessage,nullptr,GetCurrentThreadId());
+            if (threadKeys) { nextOnThread=threadBands; threadBands=this; watchingKeys=true; }
+        }
         if (!settled) {
             if (HWND candidate = merge::target(bar,true)) presentation.begin(root,candidate);
         }
@@ -873,7 +916,14 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return schedule(settled ? 500 : 25) ? S_OK : E_FAIL;
     }
     void detach() {
-        releaseFocusedKeys();
+        if (watchingKeys) {
+            watchingKeys=false;
+            auto** link=&threadBands;
+            while (*link != this) link=&(*link)->nextOnThread;
+            *link=nextOnThread;
+            nextOnThread=nullptr;
+            if (!threadBands) { UnhookWindowsHookEx(threadKeys); threadKeys=nullptr; }
+        }
         settle();
         presentation.finish();
         incoming = nullptr;

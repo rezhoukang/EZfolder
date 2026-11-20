@@ -8,7 +8,7 @@ sealed class ShortcutEditor : Forms.IMessageFilter {
     const int Ctrl=0x100, Shift=0x200, Alt=0x400;
     static readonly int[] Defaults = {Ctrl|'T',Ctrl|'W',Ctrl|9,Ctrl|Shift|9};
     public static readonly string[] Names = {"新建标签页","关闭当前标签","下一个标签","上一个标签"};
-    public const string Hint = "标签栏获得焦点时生效。点击按键组合即可修改。";
+    public const string Hint = "关闭标签页在当前资源管理器窗口内生效，其他快捷键在标签栏内生效。点击按键组合即可修改。";
     readonly int[] shortcuts = (int[])Defaults.Clone();
     public bool QuickAccess;
     public int Recording { get; private set; }
