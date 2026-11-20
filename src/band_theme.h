@@ -1,166 +1,151 @@
 #pragma once
 #include <uxtheme.h>
-#include <vssym32.h>
 
-// Keep the real tab and button controls for navigation, accessibility and hit testing.
-// The Win10 tab control has no dark ribbon renderer, so only its dark surface is drawn here.
+// Preserve the native tab control's focus, scrolling and accessibility.
 class BandTheme {
-    HTHEME checkTheme = nullptr;
-    COLORREF background = 0, surface = 0, hover = 0, edge = 0, text = 0, muted = 0;
+    COLORREF background{}, surface{}, hover{}, edge{}, text{}, selectedText{};
     HWND hotWindow = nullptr;
     int hotTab = -1;
-    static COLORREF mix(COLORREF a, COLORREF b, int percent) {
-        auto channel = [percent](int x, int y) { return (x * (100 - percent) + y * percent) / 100; };
-        return RGB(channel(GetRValue(a), GetRValue(b)), channel(GetGValue(a), GetGValue(b)), channel(GetBValue(a), GetBValue(b)));
-    }
-    static void fill(HDC dc, RECT r, COLORREF color) {
+    static void fill(HDC dc, const RECT& r, COLORREF color) {
         SetDCBrushColor(dc, color);
         FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
-    static void outline(HDC dc, RECT r, COLORREF color) {
+    static void rounded(HDC dc, RECT r, COLORREF color, int radius) {
         SetDCBrushColor(dc, color);
-        FrameRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        SelectObject(dc, GetStockObject(DC_BRUSH));
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, r.left,r.top,r.right,r.bottom,radius,radius);
     }
-    static bool darkApps() {
-        HIGHCONTRASTW hc{};
-        hc.cbSize = sizeof(hc);
-        if (!SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) || (hc.dwFlags & HCF_HIGHCONTRASTON)) return false;
-        DWORD light = 1, size = sizeof(light);
-        return RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size) == ERROR_SUCCESS && !light;
+    static void line(HDC dc, int x, int y, int x2, int y2, COLORREF color) {
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCPenColor(dc,color);
+        MoveToEx(dc,x,y,nullptr);
+        LineTo(dc,x2,y2);
     }
-    void draw(HWND w, HWND tabs, HWND check, HDC dc, const RECT& bounds) const {
-        fill(dc, bounds, background);
-        SetBkMode(dc, TRANSPARENT);
-        HFONT font = reinterpret_cast<HFONT>(SendMessageW(w, WM_GETFONT, 0, 0));
-        if (font) SelectObject(dc, font);
-        const bool focus = GetFocus() == w && !(SendMessageW(w, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS);
-        RECT line = bounds;
-        line.top = line.bottom - 1;
-        fill(dc, line, edge);
-        if (w == tabs) {
-            const int selected = TabCtrl_GetCurSel(tabs);
-            const int keyboard = TabCtrl_GetCurFocus(tabs);
-            for (int i = 0, count = TabCtrl_GetItemCount(tabs); i < count; ++i) {
-                RECT r{};
-                if (!TabCtrl_GetItemRect(tabs, i, &r) || r.right <= 0 || r.left >= bounds.right) continue;
-                r.top = 2;
-                r.bottom = bounds.bottom;
-                if (i == selected) {
-                    fill(dc, r, surface);
-                    RECT border = r;
-                    ++border.bottom;
-                    outline(dc, border, edge);
-                } else if (w == hotWindow && i == hotTab) {
-                    --r.bottom;
-                    fill(dc, r, hover);
-                }
-                wchar_t name[512]{};
-                TCITEMW item{};
-                item.mask = TCIF_TEXT;
-                item.pszText = name;
-                item.cchTextMax = 512;
-                TabCtrl_GetItem(tabs, i, &item);
-                RECT label = r;
-                InflateRect(&label, -4, 0);
-                SetTextColor(dc, IsWindowEnabled(w) ? text : muted);
-                DrawTextW(dc, name, -1, &label, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-                if (focus && i == keyboard) { InflateRect(&r, -3, -3); DrawFocusRect(dc, &r); }
-            }
+    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, int dpi) const {
+        auto px = [dpi](int n) { return MulDiv(n,dpi,96); };
+        fill(dc,bounds,background);
+        SetBkMode(dc,TRANSPARENT);
+        HFONT font = reinterpret_cast<HFONT>(SendMessageW(w,WM_GETFONT,0,0));
+        if (font) SelectObject(dc,font);
+        bool focus = GetFocus() == w && !(SendMessageW(w,WM_QUERYUISTATE,0,0) & UISF_HIDEFOCUS);
+        if (w != tabs) {
+            RECT r = bounds;
+            InflateRect(&r,-px(3),-px(3));
+            if (hotWindow == w) rounded(dc,r,hover,px(8));
+            int x = bounds.right/2, y = bounds.bottom/2, arm = px(6);
+            COLORREF ink = IsWindowEnabled(w) ? text : edge;
+            line(dc,x-arm,y,x+arm+1,y,ink);
+            line(dc,x,y-arm,x,y+arm+1,ink);
+            if (focus) DrawFocusRect(dc,&r);
             return;
         }
-        RECT area = bounds;
-        --area.bottom;
-        bool enabled = IsWindowEnabled(w) != FALSE;
-        bool pressed = (SendMessageW(w, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0;
-        bool hot = enabled && w == hotWindow;
-        if (pressed || hot) fill(dc, area, pressed ? edge : hover);
-        wchar_t name[32]{};
-        GetWindowTextW(w, name, 32);
-        UINT align = DT_CENTER;
-        if (w == check) {
-            bool checked = SendMessageW(w, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            int state = (checked ? CBS_CHECKEDNORMAL : CBS_UNCHECKEDNORMAL) +
-                        (!enabled ? 3 : pressed ? 2 : hot ? 1 : 0);
-            int dpi = GetDeviceCaps(dc, LOGPIXELSX);
-            SIZE glyph{MulDiv(13, dpi, 96), MulDiv(13, dpi, 96)};
-            if (checkTheme) GetThemePartSize(checkTheme, dc, BP_CHECKBOX, state, nullptr, TS_TRUE, &glyph);
-            int left = MulDiv(6, dpi, 96), top = (area.bottom - glyph.cy) / 2;
-            RECT box{left, top, left + glyph.cx, top + glyph.cy};
-            if (!checkTheme || FAILED(DrawThemeBackground(checkTheme, dc, BP_CHECKBOX, state, &box, nullptr)))
-                DrawFrameControl(dc, &box, DFC_BUTTON, DFCS_BUTTONCHECK | (checked ? DFCS_CHECKED : 0));
-            area.left = box.right + MulDiv(5, dpi, 96);
-            align = DT_LEFT;
+        int selected = TabCtrl_GetCurSel(tabs), count = TabCtrl_GetItemCount(tabs);
+        for (int i=0; i<count; ++i) {
+            RECT r{};
+            if (!TabCtrl_GetItemRect(tabs,i,&r) || r.right <= 0 || r.left >= bounds.right) continue;
+            r.top = px(2);
+            r.bottom = bounds.bottom - px(1);
+            bool active = i == selected, hot = w == hotWindow && i == hotTab;
+            COLORREF ink = active ? selectedText : text;
+            if (active || hot) rounded(dc,r,active ? surface : hover,px(10));
+            if (!active && i+1 < count && i+1 != selected)
+                line(dc,r.right-1,px(6),r.right-1,r.bottom-px(5),edge);
+            wchar_t title[512]{};
+            TCITEMW item{};
+            item.mask = TCIF_TEXT;
+            item.pszText = title;
+            item.cchTextMax = ARRAYSIZE(title);
+            TabCtrl_GetItem(tabs,i,&item);
+            RECT close = closeRect(r,dpi,hot);
+            RECT label = labelRect(r,dpi,hot);
+            SetTextColor(dc,ink);
+            UINT flags = DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX;
+            if (label.right-label.left >= px(30)) flags |= DT_END_ELLIPSIS;
+            DrawTextW(dc,title,-1,&label,flags);
+            if (!IsRectEmpty(&close)) {
+                int x = (close.left+close.right)/2, y = (r.top+r.bottom)/2, arm = px(3);
+                line(dc,x-arm,y-arm,x+arm+1,y+arm+1,ink);
+                line(dc,x-arm,y+arm,x+arm+1,y-arm-1,ink);
+            }
+            if (focus && i == TabCtrl_GetCurFocus(tabs)) { InflateRect(&r,-px(3),-px(3)); DrawFocusRect(dc,&r); }
         }
-        SetTextColor(dc, enabled ? text : muted);
-        DrawTextW(dc, name, -1, &area, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | align);
-        if (focus) { RECT r = bounds; InflateRect(&r, -3, -3); DrawFocusRect(dc, &r); }
     }
 public:
-    bool dark = false;
-    ~BandTheme() { if (checkTheme) CloseThemeData(checkTheme); }
-    void refresh(HWND bar, bool force) {
-        bool next = darkApps();
-        if (!force && next == dark) return;
-        dark = next;
-        if (checkTheme) { CloseThemeData(checkTheme); checkTheme = nullptr; }
-        if (dark) {
-            background = RGB(0,0,0);
-            text = RGB(244,244,244);
-            HTHEME tree = OpenThemeData(bar, L"DarkMode_Explorer::TreeView");
-            COLORREF themed;
-            if (tree) {
-                if (SUCCEEDED(GetThemeColor(tree, TVP_TREEITEM, TREIS_NORMAL, TMT_TEXTCOLOR, &themed)) &&
-                    GetRValue(themed) > 175 && GetGValue(themed) > 175 && GetBValue(themed) > 175) text = themed;
-                CloseThemeData(tree);
-            }
-            surface = mix(background, text, 13);
-            hover = mix(background, text, 20);
-            edge = mix(background, text, 32);
-            muted = mix(background, text, 54);
-            checkTheme = OpenThemeData(bar, L"DarkMode_Explorer::Button");
+    static RECT closeRect(RECT r, int dpi, bool hot) {
+        int width = MulDiv(r.right-r.left,96,dpi);
+        int button = width >= 80 ? 23 : width >= 48 ? 18 : (hot && width >= 24 ? 11 : 0);
+        r.left = r.right - MulDiv(button,dpi,96);
+        return r;
+    }
+    static RECT labelRect(RECT r, int dpi, bool hot) {
+        int padding = r.right-r.left < MulDiv(48,dpi,96) ? 2 : 7;
+        r.right = closeRect(r,dpi,hot).left;
+        r.left += MulDiv(padding,dpi,96);
+        return r;
+    }
+    void refresh(HWND bar, HWND tip, bool force) {
+        DWORD light=1, bytes=sizeof(light);
+        RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme",RRF_RT_REG_DWORD,nullptr,&light,&bytes);
+        HIGHCONTRASTW hc{};
+        hc.cbSize=sizeof(hc);
+        SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0);
+        bool contrast = (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
+        bool dark = !light && !contrast;
+        COLORREF bg = dark ? RGB(0,0,0) : GetSysColor(COLOR_WINDOW);
+        COLORREF nextSurface = contrast ? GetSysColor(COLOR_HIGHLIGHT) : dark ? RGB(48,48,48) : RGB(226,226,226);
+        if (!force && bg == background && nextSurface == surface) return;
+        background = bg;
+        surface = nextSurface;
+        text = dark ? RGB(242,242,242) : GetSysColor(COLOR_WINDOWTEXT);
+        selectedText = contrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : text;
+        hover = contrast ? bg : dark ? RGB(31,31,31) : RGB(241,241,241);
+        edge = dark ? RGB(86,86,86) : GetSysColor(COLOR_GRAYTEXT);
+        if (tip) {
+            SetWindowTheme(tip,dark ? L"" : nullptr,dark ? L"" : nullptr);
+            SendMessageW(tip,TTM_SETTIPBKCOLOR,dark ? RGB(42,42,42) : GetSysColor(COLOR_INFOBK),0);
+            SendMessageW(tip,TTM_SETTIPTEXTCOLOR,dark ? text : GetSysColor(COLOR_INFOTEXT),0);
         }
-        hotWindow = nullptr;
-        hotTab = -1;
-        RedrawWindow(bar, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        RedrawWindow(bar,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
     }
     void pointer(HWND w, HWND tabs, UINT msg, LPARAM lp) {
         HWND next = msg == WM_MOUSELEAVE ? nullptr : w;
         int index = -1;
         if (next == tabs) {
             TCHITTESTINFO hit{};
-            hit.pt = {static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
-            index = TabCtrl_HitTest(tabs, &hit);
+            hit.pt = {static_cast<short>(LOWORD(lp)),static_cast<short>(HIWORD(lp))};
+            index = TabCtrl_HitTest(tabs,&hit);
         }
         if (next == hotWindow && index == hotTab) return;
-        HWND old = hotWindow;
-        if (next && next != old) {
-            TRACKMOUSEEVENT event{sizeof(event), TME_LEAVE, next, 0};
+        if (next && next != hotWindow) {
+            TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,next,0};
             TrackMouseEvent(&event);
         }
+        HWND old = hotWindow;
         hotWindow = next;
         hotTab = index;
-        if (old) InvalidateRect(old, nullptr, FALSE);
-        if (next) InvalidateRect(next, nullptr, FALSE);
+        if (old) InvalidateRect(old,nullptr,FALSE);
+        if (next) InvalidateRect(next,nullptr,FALSE);
     }
-    void paint(HWND w, HWND tabs, HWND check, HDC target) const {
+    void paint(HWND w, HWND tabs, HDC target, int dpi) const {
         RECT r{};
-        GetClientRect(w, &r);
+        GetClientRect(w,&r);
         if (IsRectEmpty(&r)) return;
         HDC buffer = CreateCompatibleDC(target);
-        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, r.right, r.bottom) : nullptr;
+        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target,r.right,r.bottom) : nullptr;
         if (bitmap) {
-            HGDIOBJ old = SelectObject(buffer, bitmap);
-            draw(w, tabs, check, buffer, r);
-            BitBlt(target, 0, 0, r.right, r.bottom, buffer, 0, 0, SRCCOPY);
-            SelectObject(buffer, old);
+            HGDIOBJ old = SelectObject(buffer,bitmap);
+            draw(w,tabs,buffer,r,dpi);
+            BitBlt(target,0,0,r.right,r.bottom,buffer,0,0,SRCCOPY);
+            SelectObject(buffer,old);
             DeleteObject(bitmap);
         } else {
             int saved = SaveDC(target);
-            draw(w, tabs, check, target, r);
-            RestoreDC(target, saved);
+            draw(w,tabs,target,r,dpi);
+            RestoreDC(target,saved);
         }
         if (buffer) DeleteDC(buffer);
     }
-    void erase(HDC dc, HWND bar) const { RECT r{}; GetClientRect(bar, &r); fill(dc, r, background); }
+    void erase(HDC dc, HWND bar) const { RECT r{}; GetClientRect(bar,&r); fill(dc,r,background); }
 };

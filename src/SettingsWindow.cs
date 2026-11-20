@@ -1,0 +1,163 @@
+using System;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using Microsoft.Win32;
+using ApiInformation = Windows.Foundation.Metadata.ApiInformation;
+using Windows.UI.ViewManagement;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Markup;
+using Forms = System.Windows.Forms;
+using Controls = Windows.UI.Xaml.Controls;
+
+// Windows hosts and renders the XAML controls inside the settings window.
+[ComImport, Guid("E3DCD8C7-3057-4692-99C3-7B7720AFDA31"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IXamlSourceNative2 {
+    void AttachToWindow(IntPtr parent);
+    IntPtr GetWindowHandle();
+    void PreTranslateMessage(ref SettingsWindow.NativeMessage msg, [MarshalAs(UnmanagedType.Bool)] out bool handled);
+}
+
+sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NativeMessage {
+        public IntPtr hwnd;
+        public uint message;
+        public IntPtr wParam, lParam;
+        public uint time;
+        public Point point;
+        public uint privateData;
+    }
+    [DllImport("user32")] static extern bool SetWindowPos(IntPtr w,IntPtr after,int x,int y,int width,int height,uint flags);
+    [DllImport("dwmapi")] static extern int DwmSetWindowAttribute(IntPtr w,int attribute,ref int value,int size);
+    readonly DesktopWindowXamlSource source;
+    readonly IXamlSourceNative2 native;
+    readonly Controls.Grid page;
+    readonly UISettings system = new UISettings();
+    readonly IntPtr island;
+
+    public SettingsWindow(IntPtr owner) {
+        Text = "EZFolder 设置";
+        FormBorderStyle = Forms.FormBorderStyle.FixedDialog;
+        MaximizeBox = MinimizeBox = false;
+        ShowIcon = false;
+        StartPosition = Forms.FormStartPosition.Manual;
+        Rectangle work = Forms.Screen.FromHandle(owner).WorkingArea;
+        Location = work.Location;
+        source = new DesktopWindowXamlSource();
+        native = (IXamlSourceNative2)(object)source;
+        native.AttachToWindow(Handle);
+        island = native.GetWindowHandle();
+        using (var reader = new StreamReader(Assembly.GetExecutingAssembly().GetManifestResourceStream("settings.xaml")))
+            page = (Controls.Grid)XamlReader.Load(reader.ReadToEnd());
+        source.Content = page;
+        var pc = (Controls.RadioButton)page.FindName("ThisPC");
+        var quick = (Controls.RadioButton)page.FindName("QuickAccess");
+        quick.IsChecked = SettingsProgram.QuickAccess();
+        pc.IsChecked = quick.IsChecked != true;
+        ((Controls.Button)page.FindName("Save")).Click += delegate {
+            if (SettingsProgram.Save(this,quick.IsChecked == true)) Close();
+        };
+        ((Controls.Button)page.FindName("Cancel")).Click += delegate { Close(); };
+        ApplyTheme();
+        system.ColorValuesChanged += ColorsChanged;
+        Forms.Application.AddMessageFilter(this);
+        using (var graphics = CreateGraphics())
+            ClientSize = new Size((int)Math.Ceiling(380*graphics.DpiX/96), (int)Math.Ceiling(250*graphics.DpiY/96));
+        Location = new Point(work.Left+(work.Width-Width)/2, work.Top+(work.Height-Height)/2);
+        Shown += delegate { (quick.IsChecked == true ? quick : pc).Focus(FocusState.Programmatic); };
+    }
+    void ApplyTheme() {
+        var bg = system.GetColorValue(UIColorType.Background);
+        int dark = bg.R+bg.G+bg.B < 384 ? 1 : 0;
+        page.RequestedTheme = dark != 0 ? ElementTheme.Dark : ElementTheme.Light;
+        BackColor = Color.FromArgb(bg.R,bg.G,bg.B);
+        if (DwmSetWindowAttribute(Handle,20,ref dark,sizeof(int)) < 0)
+            DwmSetWindowAttribute(Handle,19,ref dark,sizeof(int));
+    }
+    void ColorsChanged(UISettings sender,object args) {
+        try { BeginInvoke((Action)ApplyTheme); } catch (InvalidOperationException) { }
+    }
+    protected override void OnResize(EventArgs e) {
+        base.OnResize(e);
+        if (island != IntPtr.Zero) SetWindowPos(island,IntPtr.Zero,0,0,ClientSize.Width,ClientSize.Height,0x40|0x10);
+    }
+    public bool PreFilterMessage(ref Forms.Message m) {
+        if (m.Msg < 0x100 || m.Msg > 0x109) return false;
+        if (m.Msg == 0x100 && m.WParam.ToInt32() == 27) { Close(); return true; }
+        var msg = new NativeMessage { hwnd=m.HWnd, message=(uint)m.Msg, wParam=m.WParam, lParam=m.LParam };
+        bool handled;
+        native.PreTranslateMessage(ref msg,out handled);
+        return handled;
+    }
+    protected override void OnFormClosed(Forms.FormClosedEventArgs e) {
+        system.ColorValuesChanged -= ColorsChanged;
+        Forms.Application.RemoveMessageFilter(this);
+        source.Dispose();
+        base.OnFormClosed(e);
+    }
+}
+
+static class SettingsProgram {
+    sealed class ExplorerOwner : Forms.IWin32Window {
+        public IntPtr Handle { get; private set; }
+        public ExplorerOwner(IntPtr handle) { Handle=handle; }
+    }
+    const string RegistryPath = @"Software\EZFolder";
+    public static bool QuickAccess() {
+        using (var key = Registry.CurrentUser.OpenSubKey(RegistryPath)) {
+            object saved = key == null ? null : key.GetValue("NewTabLocation");
+            return saved is int && (int)saved == 1;
+        }
+    }
+    public static bool Save(Forms.Form owner,bool quick) {
+        try {
+            using (var key = Registry.CurrentUser.CreateSubKey(RegistryPath))
+                key.SetValue("NewTabLocation",quick ? 1 : 0,RegistryValueKind.DWord);
+            return true;
+        } catch (Exception ex) { Forms.MessageBox.Show(owner,ex.Message,owner.Text); return false; }
+    }
+    static void RunIsland(IntPtr owner) {
+        using (var manager = WindowsXamlManager.InitializeForCurrentThread())
+        using (var window = new SettingsWindow(owner)) {
+            if (owner != IntPtr.Zero) window.Show(new ExplorerOwner(owner));
+            Forms.Application.Run(window);
+        }
+    }
+    // Windows 10 before 1903 does not host XAML Islands. Keep the same preference accessible.
+    static void RunClassic() {
+        Forms.Application.EnableVisualStyles();
+        using (var form = new Forms.Form { Text="EZFolder 设置", FormBorderStyle=Forms.FormBorderStyle.FixedDialog,
+            Font=SystemFonts.MessageBoxFont, MaximizeBox=false, MinimizeBox=false, AutoSize=true,
+            AutoSizeMode=Forms.AutoSizeMode.GrowAndShrink, StartPosition=Forms.FormStartPosition.CenterScreen }) {
+            var content=new Forms.FlowLayoutPanel { AutoSize=true, FlowDirection=Forms.FlowDirection.TopDown, Padding=new Forms.Padding(16) };
+            var pc=new Forms.RadioButton { Text="此电脑",AutoSize=true };
+            var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=QuickAccess() };
+            pc.Checked=!quick.Checked;
+            var buttons=new Forms.FlowLayoutPanel { AutoSize=true };
+            var ok=new Forms.Button {Text="确定"};
+            var cancel=new Forms.Button {Text="取消",DialogResult=Forms.DialogResult.Cancel};
+            ok.Click+=delegate { if (Save(form,quick.Checked)) form.Close(); };
+            buttons.Controls.AddRange(new Forms.Control[]{ok,cancel});
+            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,buttons});
+            form.Controls.Add(content);
+            form.AcceptButton=ok; form.CancelButton=cancel;
+            form.ShowDialog();
+        }
+    }
+    [STAThread]
+    static int Main(string[] args) {
+        try {
+            long owner;
+            if (args.Length != 1 || !long.TryParse(args[0],out owner)) return 1;
+            if (ApiInformation.IsApiContractPresent("Windows.Foundation.UniversalApiContract",8)) RunIsland(new IntPtr(owner));
+            else RunClassic();
+            return 0;
+        } catch (Exception ex) {
+            Forms.MessageBox.Show(ex.Message,"EZFolder 设置",Forms.MessageBoxButtons.OK,Forms.MessageBoxIcon.Error);
+            return 1;
+        }
+    }
+}

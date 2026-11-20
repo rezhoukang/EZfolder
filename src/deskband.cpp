@@ -29,12 +29,18 @@ using Location = std::unique_ptr<ITEMIDLIST, FreePidl>;
 #include "merge_visibility.h"
 #include "window_merge.h"
 #include "band_theme.h"
+#include "settings.h"
 
 class Band final : public IDeskBand, public IObjectWithSite, public IInputObject, public IPersistStream {
     LONG refs = 1;
     Com<IUnknown> site;
     Com<IShellBrowser> browser;
-    HWND bar = nullptr, tabs = nullptr, add = nullptr, close = nullptr, mergeButton = nullptr;
+    HWND bar = nullptr, tabs = nullptr, add = nullptr;
+    SIZE stripSize{-1,-1}, itemSize{-1,-1};
+    HWND tooltip = nullptr;
+    TOOLINFOW tipTool{};
+    int hoverIndex = -1;
+    std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> tipTitle{nullptr,CoTaskMemFree};
     HFONT font = nullptr;
     BandTheme theme;
     ULONGLONG nextThemeCheck = 0;
@@ -42,10 +48,20 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     std::vector<Location> folders;
     int active = -1, destination = -1;
     bool closeAfterSwitch = false;
+    int pendingNew = -1;
+    int pressedTab = -1;
+    bool pressedClose = false;
+    POINT pressPoint{};
+    int separating = -1;
+    HWND independent = nullptr;
+    Location separationFolder;
+    ULONGLONG separationDeadline = 0;
+    POINT separationPoint{};
     ULONGLONG deadline = 0;
-    enum { NewTab = 100, CloseTab, TabControl, MergeWindows };
+    enum { NewTab = 100, TabControl = 102 };
     static constexpr UINT importMessage = WM_APP + 27;
     static constexpr UINT refreshMessage = WM_APP + 28;
+    static constexpr UINT separateMessage = WM_APP + 29;
     HWND incoming = nullptr;
     HWND awaitingAck = nullptr;
     LPARAM incomingBirth = 0;
@@ -83,8 +99,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         importIndex = -1;
     }
     LRESULT reserve(HWND source, LPARAM birth) {
-        if (!settled || active < 0 || destination >= 0 || incoming ||
-            (awaitingAck && GetPropW(awaitingAck, merge::offerProp) == bar) || !merge::enabled() ||
+        if (!settled || active < 0 || destination >= 0 || incoming || !hasRoom() ||
+            (awaitingAck && GetPropW(awaitingAck, merge::offerProp) == bar) || separating >= 0 ||
             !validOffer(source, birth)) return 0;
         incoming = source;
         incomingBirth = birth;
@@ -96,7 +112,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!source) return;
         Location id = merge::LocalOffer::read(source, bar, incomingBirth);
         if (!id) id = merge::folderOf(source);
-        if (!validOffer(source, incomingBirth) || !merge::enabled()) { endImport(false); return; }
+        if (!validOffer(source, incomingBirth) || !hasRoom()) {
+            if (validOffer(source,incomingBirth)) PostMessageW(source,merge::retry(),reinterpret_cast<WPARAM>(bar),incomingBirth);
+            endImport(false);
+            return;
+        }
         if (!id) {
             // A visible view can precede its registration in ShellWindows.
             PostMessageW(source, merge::retry(), reinterpret_cast<WPARAM>(bar), incomingBirth);
@@ -123,9 +143,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&folder.p))) &&
             SUCCEEDED(folder->ItemCount(SVGIO_SELECTION, &count)) && count > 0;
     }
-    void checkNewWindow(bool enabled) {
+    void checkNewWindow() {
         if (settled) return;
-        if (!enabled || folders.size() > 1 || GetTickCount64() - opened > 20000) { settle(); return; }
+        if (GetPropW(merge::frame(bar), merge::keepFrame) || folders.size() > 1 || GetTickCount64() - opened > 20000) { settle(); return; }
         if (offered || active < 0 || !merge::live(bar)) return;
         HWND host = merge::target(bar);
         if (!host) {
@@ -180,7 +200,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!PostMessageW(root, WM_CLOSE, 0, 0)) presentation.finish();
     }
     bool validSourceAck(HWND host, LPARAM birth) const {
-        return merge::enabled() && merge::live(host) && merge::live(bar) && GetPropW(bar, merge::offerProp) == host &&
+        return !GetPropW(merge::frame(bar), merge::keepFrame) && merge::live(host) && merge::live(bar) && GetPropW(bar, merge::offerProp) == host &&
             reinterpret_cast<LPARAM>(GetPropW(bar, merge::birthProp)) == birth;
     }
     void tick() {
@@ -191,18 +211,15 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             return;
         }
         if (now >= nextThemeCheck) {
-            theme.refresh(bar, false);
+            theme.refresh(bar, tooltip, false);
             nextThemeCheck = now + 1000;
         }
-        bool enabled = merge::enabled();
-        const int state = enabled ? BST_CHECKED : BST_UNCHECKED;
-        if (SendMessageW(mergeButton, BM_GETCHECK, 0, 0) != state)
-            SendMessageW(mergeButton, BM_SETCHECK, state, 0);
         sync();
-        checkNewWindow(enabled);
+        checkSeparation();
+        checkNewWindow();
         if (confirming) received(confirming, confirmingBirth);
         UINT period = 500;
-        if (confirming || destination >= 0 || (!settled && !offered))
+        if (separating >= 0 || confirming || destination >= 0 || (!settled && !offered))
             period = destination >= 0 || now - opened < 1000 ? 25 : 100;
         schedule(period);
     }
@@ -226,6 +243,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return Location(id);
     }
     bool label(int i, bool insert) {
+        if (i == hoverIndex) hideTitle();
         PWSTR name = nullptr;
         SHGetNameFromIDList(folders[i].get(), SIGDN_NORMALDISPLAY, &name);
         TCITEMW item{};
@@ -237,16 +255,19 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return ok;
     }
     void controls() {
-        TabCtrl_SetCurSel(tabs, active);
-        EnableWindow(tabs, destination < 0);
-        EnableWindow(add, active >= 0 && destination < 0);
-        EnableWindow(close, folders.size() > 1 && destination < 0);
+        if (!tabs || !add) return;
+        if (TabCtrl_GetCurSel(tabs) != active) TabCtrl_SetCurSel(tabs,active);
+        EnableWindow(tabs, destination < 0 && separating < 0);
+        layout();
+        InvalidateRect(tabs, nullptr, FALSE);
     }
     int append(Location location, bool activate = true) {
         if (!location) return -1;
         int index = static_cast<int>(folders.size());
         folders.push_back(std::move(location));
-        if (!label(index, true)) { folders.pop_back(); return -1; }
+        // Reserve space before the native control decides whether to show its overflow buttons.
+        layout();
+        if (!label(index, true)) { folders.pop_back(); layout(); return -1; }
         if (activate) active = index;
         controls();
         return index;
@@ -262,6 +283,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         destination = -1;
         if (closeAfterSwitch) erase(previous);
         closeAfterSwitch = false;
+        pendingNew = -1;
         endImport(true);
         controls();
     }
@@ -277,6 +299,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             destination = -1;
             closeAfterSwitch = false;
             endImport(false);
+            if (pendingNew >= 0) { erase(pendingNew); pendingNew = -1; }
             controls();
             MessageBeep(MB_ICONWARNING);
         }
@@ -309,34 +332,244 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             destination = -1;
             closeAfterSwitch = false;
             endImport(false);
+            if (pendingNew >= 0) { erase(pendingNew); pendingNew = -1; }
             controls();
             MessageBeep(MB_ICONWARNING);
         } else sync();
     }
-    void newTab() {
-        if (destination < 0) {
-            settle();
-            sync();
-            if (active >= 0) append(Location(ILCloneFull(folders[active].get())));
-        }
+    void newTab(bool replaceLast = false) {
+        if (destination >= 0 || separating >= 0 || incoming || (!replaceLast && !hasRoom())) return;
+        settle();
+        sync();
+        if (active < 0) return;
+        PIDLIST_ABSOLUTE id = nullptr;
+        HRESULT hr = settings::quickAccess()
+            ? SHParseDisplayName(L"shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}",nullptr,&id,0,nullptr)
+            : SHGetKnownFolderIDList(FOLDERID_ComputerFolder,0,nullptr,&id);
+        if (FAILED(hr)) { MessageBeep(MB_ICONWARNING); return; }
+        Location target(id);
+        if (replaceLast && ILIsEqual(target.get(),folders[active].get())) return;
+        pendingNew = append(std::move(target),false);
+        if (pendingNew >= 0) select(pendingNew,replaceLast);
     }
     void closeTab(int index) {
-        if (destination >= 0 || folders.size() <= 1 || index < 0) return;
+        if (destination >= 0 || separating >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
+        if (folders.size() == 1) { newTab(true); return; }
         if (index == active) select(index > 0 ? index - 1 : 1, true);
         else { erase(index); controls(); }
+    }
+    void checkSeparation() {
+        if (separating < 0 || !independent) return;
+        HWND root = independent;
+        bool owned = GetPropW(root, merge::keepFrame) == bar;
+        Location actual = owned ? merge::folderOf(root) : Location{};
+        if (root != independent || separating < 0) return; // COM may pump messages.
+        bool landed = actual && IsWindowVisible(root) && ILIsEqual(actual.get(),separationFolder.get());
+        if (owned && !landed && GetTickCount64() < separationDeadline) return;
+        int index = separating;
+        separating = -1;
+        independent = nullptr;
+        bool original = index < static_cast<int>(folders.size()) &&
+            ILIsEqual(folders[index].get(),separationFolder.get());
+        separationFolder.reset();
+        if (landed && original) closeTab(index);
+        else if (!landed) MessageBeep(MB_ICONWARNING);
+        controls();
+    }
+    void separate(int index, POINT drop) {
+        if (destination >= 0 || separating >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
+        settle();
+        HWND source = merge::frame(bar);
+        if (folders.size() == 1) {
+            if (IsZoomed(source)) ShowWindow(source,SW_RESTORE);
+            SetWindowPos(source,nullptr,drop.x-scale(65),drop.y-scale(50),0,0,SWP_NOSIZE|SWP_NOZORDER);
+            return;
+        }
+        // Reserve this exact, initially hidden Explorer instance before it can offer a tab.
+        separationFolder.reset(ILCloneFull(folders[index].get()));
+        if (!separationFolder) return;
+        separating = index;
+        separationPoint = drop;
+        if (!PostMessageW(bar,separateMessage,0,0)) {
+            separating = -1;
+            separationFolder.reset();
+            return;
+        }
+        controls();
+    }
+    void openSeparateWindow() {
+        if (separating < 0 || independent || !separationFolder) return;
+        HWND source = merge::frame(bar);
+        POINT drop = separationPoint;
+        Com<IWebBrowser2> web;
+        HRESULT hr = CoCreateInstance(CLSID_ShellBrowserWindow,nullptr,CLSCTX_LOCAL_SERVER,IID_PPV_ARGS(&web.p));
+        SHANDLE_PTR handle = 0;
+        if (SUCCEEDED(hr)) hr = web->get_HWND(&handle);
+        HWND root = reinterpret_cast<HWND>(handle);
+        if (SUCCEEDED(hr) && (!bar || !separationFolder || !root || root == source ||
+            !SetPropW(root,merge::keepFrame,bar))) hr = E_FAIL;
+        VARIANT target{};
+        if (SUCCEEDED(hr)) {
+            UINT bytes = ILGetSize(separationFolder.get());
+            target.parray = SafeArrayCreateVector(VT_UI1,0,bytes);
+            if (!target.parray) hr = E_OUTOFMEMORY;
+            else {
+                target.vt = VT_ARRAY | VT_UI1;
+                memcpy(target.parray->pvData,separationFolder.get(),bytes);
+                VARIANT empty{};
+                hr = web->Navigate2(&target,&empty,&empty,&empty,&empty);
+            }
+        }
+        VariantClear(&target);
+        if (SUCCEEDED(hr)) {
+            SetWindowPos(root,nullptr,drop.x-scale(65),drop.y-scale(50),0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+            hr = web->put_Visible(VARIANT_TRUE);
+        }
+        if (FAILED(hr) || !bar || separating < 0) {
+            if (web.p && !IsWindowVisible(root)) web->Quit();
+            separating = -1;
+            separationFolder.reset();
+            if (bar) controls();
+            MessageBeep(MB_ICONWARNING);
+            return;
+        }
+        independent = root;
+        separationDeadline = GetTickCount64()+15000;
+        SetForegroundWindow(root);
+        schedule(25);
+    }
+    bool tabMouse(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+        if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE || (msg == WM_KEYDOWN && wp == VK_ESCAPE)) {
+            if (pressedTab < 0) return false;
+            pressedTab = -1;
+            if (GetCapture() == w) ReleaseCapture();
+            return msg == WM_KEYDOWN;
+        }
+        if (msg != WM_LBUTTONDOWN && msg != WM_LBUTTONUP) return false;
+        TCHITTESTINFO hit{};
+        hit.pt = {static_cast<short>(LOWORD(lp)),static_cast<short>(HIWORD(lp))};
+        int index = TabCtrl_HitTest(w,&hit);
+        RECT item{};
+        bool onClose = false;
+        if (index >= 0 && TabCtrl_GetItemRect(w,index,&item)) {
+            RECT box = BandTheme::closeRect(item,scale(96),true);
+            onClose = PtInRect(&box,hit.pt);
+        }
+        if (msg == WM_LBUTTONDOWN) {
+            if (index < 0) return false;
+            SetFocus(w);
+            pressedTab = index;
+            pressedClose = onClose;
+            pressPoint = hit.pt;
+            SetCapture(w);
+            return true;
+        }
+        int pressed = pressedTab;
+        if (pressed < 0) return false;
+        pressedTab = -1;
+        ReleaseCapture();
+        POINT screen = hit.pt;
+        ClientToScreen(w,&screen);
+        RECT strip{};
+        GetWindowRect(bar,&strip);
+        if (pressedClose) {
+            if (onClose && index == pressed) closeTab(pressed);
+        } else if (!PtInRect(&strip,screen) &&
+            (abs(hit.pt.x-pressPoint.x) >= GetSystemMetrics(SM_CXDRAG) ||
+             abs(hit.pt.y-pressPoint.y) >= GetSystemMetrics(SM_CYDRAG))) {
+            separate(pressed,screen);
+        } else if (index == pressed && !onClose) select(index);
+        return true;
+    }
+    void hideTitle() {
+        if (hoverIndex < 0) return;
+        hoverIndex = -1;
+        if (tooltip) SendMessageW(tooltip,TTM_TRACKACTIVATE,FALSE,reinterpret_cast<LPARAM>(&tipTool));
+    }
+    void trackTitle(UINT msg, LPARAM lp) {
+        if (!tooltip) return;
+        if (msg == WM_MOUSELEAVE || msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN || pressedTab >= 0) {
+            hideTitle();
+            return;
+        }
+        TCHITTESTINFO hit{};
+        hit.pt = {static_cast<short>(LOWORD(lp)),static_cast<short>(HIWORD(lp))};
+        int i = TabCtrl_HitTest(tabs,&hit);
+        if (i != hoverIndex) {
+            hideTitle();
+            if (i < 0) return;
+            hoverIndex = i;
+            TRACKMOUSEEVENT track{sizeof(track),TME_HOVER|TME_LEAVE,tabs,HOVER_DEFAULT};
+            TrackMouseEvent(&track);
+        }
+        if (msg != WM_MOUSEHOVER || i < 0 || i >= static_cast<int>(folders.size())) return;
+        RECT r{};
+        if (!TabCtrl_GetItemRect(tabs,i,&r)) return;
+        PWSTR name = nullptr;
+        if (FAILED(SHGetNameFromIDList(folders[i].get(),SIGDN_NORMALDISPLAY,&name)) || !name) return;
+        tipTitle.reset(name);
+        RECT label = BandTheme::labelRect(r,scale(96),true);
+        HDC dc = GetDC(tabs);
+        if (!dc) return;
+        HFONT face = reinterpret_cast<HFONT>(SendMessageW(tabs,WM_GETFONT,0,0));
+        HGDIOBJ old = face ? SelectObject(dc,face) : nullptr;
+        SIZE size{};
+        GetTextExtentPoint32W(dc,name,lstrlenW(name),&size);
+        if (old) SelectObject(dc,old);
+        ReleaseDC(tabs,dc);
+        if (size.cx <= label.right-label.left) return;
+        tipTool.lpszText = name;
+        SendMessageW(tooltip,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&tipTool));
+        RECT strip{};
+        GetWindowRect(bar,&strip);
+        POINT anchor{r.left,0};
+        ClientToScreen(tabs,&anchor);
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        POINT pos{anchor.x,strip.bottom+scale(2)};
+        if (GetMonitorInfoW(MonitorFromPoint(pos,MONITOR_DEFAULTTONEAREST),&monitor)) {
+            pos.x = std::max(monitor.rcWork.left,std::min(pos.x,monitor.rcWork.right-size.cx-scale(16)));
+        }
+        SendMessageW(tooltip,TTM_TRACKPOSITION,0,MAKELPARAM(pos.x,pos.y));
+        SendMessageW(tooltip,TTM_TRACKACTIVATE,TRUE,reinterpret_cast<LPARAM>(&tipTool));
+    }
+    int capacity(int barWidth) const {
+        return std::max(1,(barWidth-scale(32)-scale(6))/scale(24));
+    }
+    bool hasRoom() const {
+        RECT r{};
+        return bar && GetClientRect(bar,&r) && static_cast<int>(folders.size()) < capacity(r.right);
     }
     void layout() {
         RECT r{};
         GetClientRect(bar, &r);
-        int mergeWidth = std::min(scale(102), static_cast<int>(r.right) / 3);
-        int buttonWidth = std::min(scale(52), static_cast<int>(r.right) / 5);
-        int width = r.right - 2 * buttonWidth - mergeWidth;
-        MoveWindow(tabs, 0, 0, width, r.bottom, TRUE);
-        MoveWindow(add, width, 0, buttonWidth, r.bottom, TRUE);
-        MoveWindow(close, width + buttonWidth, 0, buttonWidth, r.bottom, TRUE);
-        MoveWindow(mergeButton, width + 2 * buttonWidth, 0, mergeWidth, r.bottom, TRUE);
+        if (!tabs || !add || r.right <= 0) return;
+        int button = scale(32);
+        int available = std::max(0,static_cast<int>(r.right)-button);
+        int count = std::max(1,static_cast<int>(folders.size()));
+        hideTitle();
+        bool room = static_cast<int>(folders.size()) < capacity(r.right);
+        if (room) RemovePropW(bar,merge::fullProp);
+        else SetPropW(bar,merge::fullProp,reinterpret_cast<HANDLE>(1));
+        EnableWindow(add,room && active >= 0 && destination < 0 && separating < 0);
+        int item = std::clamp((available-scale(6))/count,1,scale(132));
+        int height = std::max(1,static_cast<int>(r.bottom)-scale(3));
+        bool resize = stripSize.cx != available || stripSize.cy != r.bottom;
+        // Widen the control before growing its items, shrink the items before narrowing it.
+        if (resize && available >= stripSize.cx) MoveWindow(tabs,0,0,available,r.bottom,FALSE);
+        if (itemSize.cx != item || itemSize.cy != height) {
+            TabCtrl_SetItemSize(tabs,item,height);
+            itemSize = {item,height};
+        }
+        if (resize) {
+            if (available < stripSize.cx) MoveWindow(tabs,0,0,available,r.bottom,FALSE);
+            MoveWindow(add,available,0,button,r.bottom,FALSE);
+            stripSize = {available,r.bottom};
+            RedrawWindow(bar,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
+        }
     }
     bool key(WPARAM vk) {
+        if (separating >= 0) return false;
         if (!(GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return false;
         if (vk == 'T') newTab();
         else if (vk == 'W') closeTab(active);
@@ -349,21 +582,21 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static LRESULT CALLBACK childProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
         try {
-            if (self->theme.dark) {
-                if (msg == WM_ERASEBKGND) return 1;
-                if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
-                    PAINTSTRUCT ps{};
-                    HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : reinterpret_cast<HDC>(wp);
-                    if (dc) self->theme.paint(w, self->tabs, self->mergeButton, dc);
-                    if (msg == WM_PAINT) EndPaint(w, &ps);
-                    return 0;
-                }
-                if (msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE) self->theme.pointer(w, self->tabs, msg, lp);
-                if (msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS ||
-                    msg == WM_UPDATEUISTATE || msg == BM_SETCHECK || msg == BM_SETSTATE ||
-                    msg == TCM_SETCURSEL || msg == WM_LBUTTONUP || msg == WM_LBUTTONDOWN)
-                    InvalidateRect(w, nullptr, FALSE);
+            if (msg == WM_ERASEBKGND) return 1;
+            if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
+                PAINTSTRUCT ps{};
+                HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : reinterpret_cast<HDC>(wp);
+                if (dc) self->theme.paint(w, self->tabs, dc, self->scale(96));
+                if (msg == WM_PAINT) EndPaint(w, &ps);
+                return 0;
             }
+            if (msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE) self->theme.pointer(w, self->tabs, msg, lp);
+            if (w == self->tabs && (msg == WM_MOUSEMOVE || msg == WM_MOUSEHOVER || msg == WM_MOUSELEAVE ||
+                msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN)) self->trackTitle(msg,lp);
+            if (msg == WM_ENABLE || msg == WM_SETFOCUS || msg == WM_KILLFOCUS ||
+                msg == WM_UPDATEUISTATE || msg == BM_SETSTATE || msg == TCM_SETCURSEL ||
+                msg == WM_LBUTTONUP || msg == WM_LBUTTONDOWN) InvalidateRect(w, nullptr, FALSE);
+            if (w == self->tabs && self->tabMouse(w,msg,wp,lp)) return 0;
             if (msg == WM_MBUTTONUP && w == self->tabs) {
                 TCHITTESTINFO hit{};
                 hit.pt = {static_cast<short>(LOWORD(lp)), static_cast<short>(HIWORD(lp))};
@@ -390,34 +623,37 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 }
                 return 0;
             }
-            if (msg == importMessage || msg == merge::received() || msg == WM_TIMER || msg == refreshMessage) {
+            if (msg == importMessage || msg == separateMessage || msg == merge::received() || msg == WM_TIMER || msg == refreshMessage) {
                 Com<IDeskBand> guard;
                 self->AddRef();
                 guard.p = self;
                 if (msg == importMessage) self->importWindow();
+                else if (msg == separateMessage) self->openSeparateWindow();
                 else if (msg == WM_TIMER || msg == refreshMessage) self->tick();
                 else self->received(reinterpret_cast<HWND>(wp), lp);
                 return 0;
             }
             switch (msg) {
             case WM_THEMECHANGED: case WM_SYSCOLORCHANGE: case WM_SETTINGCHANGE:
-                self->theme.refresh(w, true);
+                self->theme.refresh(w, self->tooltip, true);
                 break;
             case WM_ERASEBKGND:
-                if (self->theme.dark) { self->theme.erase(reinterpret_cast<HDC>(wp), w); return 1; }
-                break;
+                self->theme.erase(reinterpret_cast<HDC>(wp),w); return 1;
+            case WM_PAINT: {
+                PAINTSTRUCT ps{};
+                HDC dc = BeginPaint(w,&ps);
+                if (dc) self->theme.erase(dc,w);
+                EndPaint(w,&ps);
+                return 0;
+            }
+            case WM_PRINTCLIENT:
+                self->theme.erase(reinterpret_cast<HDC>(wp),w); return 0;
             case WM_SIZE: self->layout(); break;
             case WM_SETFOCUS: SetFocus(self->tabs); break;
             case WM_COMMAND:
                 if (HIWORD(wp) == BN_CLICKED) {
                     if (LOWORD(wp) == NewTab) self->newTab();
-                    if (LOWORD(wp) == CloseTab) self->closeTab(self->active);
-                    if (LOWORD(wp) == MergeWindows) {
-                        self->settle();
-                        if (!merge::setEnabled(SendMessageW(self->mergeButton, BM_GETCHECK, 0, 0) == BST_CHECKED))
-                            MessageBeep(MB_ICONWARNING);
-                        self->tick();
-                    }
+
                 }
                 break;
             case WM_NOTIFY: {
@@ -431,7 +667,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 if (root && GetPropW(root, merge::bandProp) == w) RemovePropW(root, merge::bandProp);
                 RemovePropW(w, merge::birthProp);
                 RemovePropW(w, merge::offerProp);
-                self->bar = self->tabs = self->add = self->close = self->mergeButton = nullptr;
+                self->bar = self->tabs = self->add = self->tooltip = nullptr;
                 break;
             }
             }
@@ -460,8 +696,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!bar || !SetWindowSubclass(bar, barProc, 1, reinterpret_cast<DWORD_PTR>(this))) return E_FAIL;
         opened = GetTickCount64();
         HWND root = merge::frame(bar);
-        const bool mergeEnabled = merge::enabled();
-        settled = !mergeEnabled || !root || GetPropW(root, L"EZFolder.KeepExistingFrame");
+        settled = !root || GetPropW(root, merge::keepFrame);
         offered = false;
         closingMergedFrame = false;
         SetPropW(bar, merge::birthProp, reinterpret_cast<HANDLE>(opened + 1));
@@ -471,21 +706,29 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             return CreateWindowExW(0, type, title, WS_VISIBLE | WS_CHILD | WS_TABSTOP | style,
                     0, 0, 0, 0, bar, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), module, nullptr);
         };
-        tabs = child(WC_TABCONTROLW, L"文件夹标签", TabControl, TCS_SINGLELINE | TCS_FOCUSONBUTTONDOWN | WS_CLIPCHILDREN);
-        add = child(WC_BUTTONW, L"新建", NewTab, BS_PUSHBUTTON);
-        close = child(WC_BUTTONW, L"关闭", CloseTab, BS_PUSHBUTTON);
-        mergeButton = child(WC_BUTTONW, L"合并新窗口", MergeWindows, BS_AUTOCHECKBOX);
+        // The multiline variant has no pager. layout() fits the items into a single visible row.
+        tabs = child(WC_TABCONTROLW, L"文件夹标签", TabControl,
+                     TCS_MULTILINE | TCS_RAGGEDRIGHT | TCS_FIXEDWIDTH | TCS_FOCUSONBUTTONDOWN | WS_CLIPCHILDREN);
+        add = child(WC_BUTTONW, L"新建标签页", NewTab, BS_PUSHBUTTON);
         NONCLIENTMETRICSW metrics{};
         metrics.cbSize = sizeof(metrics);
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
             font = CreateFontIndirectW(&metrics.lfMessageFont);
-        for (HWND w : {tabs, add, close, mergeButton}) {
+        for (HWND w : {tabs, add}) {
             if (!w || !SetWindowSubclass(w, childProc, 1, reinterpret_cast<DWORD_PTR>(this))) return E_FAIL;
             SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)), FALSE);
         }
-        TabCtrl_SetPadding(tabs, scale(11), scale(3));
-        theme.refresh(bar, true);
-        SendMessageW(mergeButton, BM_SETCHECK, mergeEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(tabs,TCM_SETMINTABWIDTH,0,1);
+        tooltip = CreateWindowExW(WS_EX_TOPMOST|WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW,TOOLTIPS_CLASSW,nullptr,
+            WS_POPUP|TTS_NOPREFIX|TTS_ALWAYSTIP,0,0,0,0,bar,nullptr,module,nullptr);
+        if (!tooltip) return E_FAIL;
+        tipTool.cbSize = TTTOOLINFOW_V2_SIZE;
+        tipTool.hwnd = tabs;
+        tipTool.uId = 1;
+        tipTool.uFlags = TTF_TRACK|TTF_ABSOLUTE;
+        tipTool.lpszText = const_cast<wchar_t*>(L"");
+        if (!SendMessageW(tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tipTool))) return E_FAIL;
+        theme.refresh(bar, tooltip, true);
         controls();
         sync();
         if (!settled && active >= 0) offeredFolder.reset(ILCloneFull(folders[active].get()));
@@ -498,11 +741,18 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         incoming = nullptr;
         awaitingAck = nullptr;
         importIndex = -1;
+        hideTitle();
+        if (tooltip) DestroyWindow(tooltip);
+        tooltip = nullptr;
+        tipTitle.reset();
         if (bar) DestroyWindow(bar);
-        bar = tabs = add = close = mergeButton = nullptr;
+        bar = tabs = add = nullptr;
+        stripSize = itemSize = {-1,-1};
         if (font) { DeleteObject(font); font = nullptr; }
         folders.clear();
-        active = destination = -1;
+        active = destination = pendingNew = pressedTab = separating = -1;
+        independent = nullptr;
+        separationFolder.reset();
         closeAfterSwitch = false;
         timerPeriod = 0;
         browser.reset();
@@ -542,7 +792,7 @@ public:
     STDMETHODIMP ContextSensitiveHelp(BOOL) override { return E_NOTIMPL; }
     STDMETHODIMP ShowDW(BOOL show) override {
         if (bar) {
-            if (!show && !closingMergedFrame) presentation.finish();
+            if (!show) { hideTitle(); if (!closingMergedFrame) presentation.finish(); }
             ShowWindow(bar, show ? SW_SHOWNA : SW_HIDE);
             if (show) PostMessageW(bar, refreshMessage, 0, 0);
         }

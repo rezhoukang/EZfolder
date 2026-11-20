@@ -71,25 +71,15 @@ public:
         return result;
     }
 };
-constexpr wchar_t settings[] = L"Software\\EZFolder";
+constexpr wchar_t keepFrame[] = L"EZFolder.KeepExistingFrame";
 constexpr wchar_t bandProp[] = L"EZFolder.Band.2";
+constexpr wchar_t fullProp[] = L"EZFolder.Full";
 constexpr wchar_t birthProp[] = L"EZFolder.Created.2";
 constexpr wchar_t offerProp[] = L"EZFolder.MergeTarget.2";
 inline UINT request() { static UINT id = RegisterWindowMessageW(L"EZFolder.RequestTab.2"); return id; }
 inline UINT received() { static UINT id = RegisterWindowMessageW(L"EZFolder.ReceivedTab.2"); return id; }
 inline UINT retry() { static UINT id = RegisterWindowMessageW(L"EZFolder.RetryTab.2"); return id; }
 
-inline bool enabled() {
-    DWORD value = 1, bytes = sizeof(value);
-    LSTATUS result = RegGetValueW(HKEY_CURRENT_USER, settings, L"MergeNewWindows",
-                                  RRF_RT_REG_DWORD, nullptr, &value, &bytes);
-    return result == ERROR_FILE_NOT_FOUND || (result == ERROR_SUCCESS && value != 0);
-}
-inline bool setEnabled(bool value) {
-    DWORD setting = value;
-    return RegSetKeyValueW(HKEY_CURRENT_USER, settings, L"MergeNewWindows", REG_DWORD,
-                           &setting, sizeof(setting)) == ERROR_SUCCESS;
-}
 inline HWND frame(HWND band) {
     HWND root = GetAncestor(band, GA_ROOT);
     wchar_t name[32]{};
@@ -104,7 +94,7 @@ struct Search { HWND source; HWND result; };
 inline BOOL CALLBACK olderWindow(HWND root, LPARAM data) {
     auto& s = *reinterpret_cast<Search*>(data);
     HWND candidate = static_cast<HWND>(GetPropW(root, bandProp));
-    if (!candidate || !live(candidate) || !IsWindowEnabled(root)) return TRUE;
+    if (!candidate || GetPropW(candidate,fullProp) || !live(candidate) || !IsWindowEnabled(root)) return TRUE;
     DWORD cloaked = 0;
     if (SUCCEEDED(DwmGetWindowAttribute(root, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
     auto birth = reinterpret_cast<ULONG_PTR>(GetPropW(candidate, birthProp));

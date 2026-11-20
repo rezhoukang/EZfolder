@@ -2,7 +2,10 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <commctrl.h>
+#include <uxtheme.h>
+#include <string>
 #include <exdisp.h>
+#include <oleacc.h>
 #include <strsafe.h>
 #include <algorithm>
 #include <new>
@@ -11,9 +14,13 @@ namespace {
 constexpr wchar_t managerClass[] = L"EZFolder.EntryManager";
 constexpr wchar_t entryClass[] = L"EZFolder.RibbonEntry";
 constexpr wchar_t bandId[] = L"{5129B68D-A44B-427B-AEE1-53137D3989EA}";
+constexpr wchar_t tipText[] = L"EZfolder";
 constexpr UINT toggleMessage = WM_APP + 1;
 HINSTANCE instance;
 HWND manager;
+constexpr UINT settingsCommand = 200;
+HANDLE settingsProcess;
+HWND pendingSettingsOwner;
 bool dark, highContrast;
 
 template<class T> struct Com {
@@ -98,16 +105,17 @@ Entry* state(HWND w) { return reinterpret_cast<Entry*>(GetWindowLongPtrW(w, GWLP
 const wchar_t* action(bool on) { return on ? L"隐藏 EZFolder 标签栏" : L"显示 EZFolder 标签栏"; }
 void describe(Entry& e) {
     SetWindowTextW(e.button, action(e.on));
-    if (e.tooltip) {
-        TOOLINFOW tool{};
-        tool.cbSize = sizeof(tool);
-        tool.hwnd = GetParent(e.button);
-        tool.uId = reinterpret_cast<UINT_PTR>(e.button);
-        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        tool.lpszText = const_cast<wchar_t*>(action(e.on));
-        SendMessageW(e.tooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
-    }
     InvalidateRect(e.button, nullptr, FALSE);
+}
+void styleTooltip(const Entry& e) {
+    if (!e.tooltip) return;
+    const bool darkTip = dark && !highContrast;
+    SetWindowTheme(e.tooltip, darkTip ? L"" : nullptr, darkTip ? L"" : nullptr);
+    SendMessageW(e.tooltip,TTM_SETTIPBKCOLOR,darkTip ? RGB(42,42,42) : GetSysColor(COLOR_INFOBK),0);
+    SendMessageW(e.tooltip,TTM_SETTIPTEXTCOLOR,darkTip ? RGB(248,248,248) : GetSysColor(COLOR_INFOTEXT),0);
+    int x = MulDiv(6,e.dpi,96), y = MulDiv(4,e.dpi,96);
+    RECT margin{x,y,x,y};
+    SendMessageW(e.tooltip,TTM_SETMARGIN,0,reinterpret_cast<LPARAM>(&margin));
 }
 void paint(const DRAWITEMSTRUCT& d, const Entry& e) {
     bool down = (d.itemState & ODS_SELECTED) != 0;
@@ -131,18 +139,118 @@ void paint(const DRAWITEMSTRUCT& d, const Entry& e) {
     MoveToEx(d.hDC,x+px(6),y,nullptr); LineTo(d.hDC,x+px(6),y+px(3));
     SelectObject(d.hDC,old);
     DeleteObject(pen);
-    if (e.on) {
-        RECT marker{px(4),d.rcItem.bottom-px(2),d.rcItem.right-px(4),d.rcItem.bottom};
-        SetDCBrushColor(d.hDC, highContrast ? fg : GetSysColor(COLOR_HIGHLIGHT));
-        FillRect(d.hDC,&marker,static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-    }
     if ((d.itemState & ODS_FOCUS) && !(d.itemState & ODS_NOFOCUSRECT)) {
         RECT focus = d.rcItem; InflateRect(&focus,-2,-2); DrawFocusRect(d.hDC,&focus);
     }
     RestoreDC(d.hDC,saved);
 }
+BOOL CALLBACK raiseSettings(HWND w,LPARAM process) {
+    DWORD pid=0;
+    GetWindowThreadProcessId(w,&pid);
+    if (pid!=static_cast<DWORD>(process) || !IsWindowVisible(w)) return TRUE;
+    wchar_t title[32]{};
+    if (!GetWindowTextW(w,title,ARRAYSIZE(title)) || wcscmp(title,L"EZFolder 设置")) return TRUE;
+    if (IsIconic(w)) ShowWindow(w,SW_RESTORE);
+    SetForegroundWindow(w);
+    return FALSE;
+}
+void openSettings(HWND owner) {
+    pendingSettingsOwner=nullptr;
+    if (settingsProcess) {
+        if (WaitForSingleObject(settingsProcess,0)==WAIT_TIMEOUT) {
+            // The previous form may have closed while its XAML thread is still exiting.
+            if (EnumWindows(raiseSettings,GetProcessId(settingsProcess))) pendingSettingsOwner=owner;
+            return;
+        }
+        CloseHandle(settingsProcess);
+        settingsProcess=nullptr;
+    }
+    wchar_t path[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr,path,ARRAYSIZE(path))) return;
+    std::wstring exe(path);
+    const size_t name=exe.find_last_of(L"\\/")+1;
+    const std::wstring prefix=L"EZFolderEntry";
+    if (exe.compare(name,prefix.size(),prefix)!=0) return;
+    exe.replace(name,prefix.size(),L"EZFolderSettings");
+    std::wstring command=L"\""+exe+L"\" "+std::to_wstring(reinterpret_cast<UINT_PTR>(owner));
+    STARTUPINFOW startup{};
+    startup.cb=sizeof(startup);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startup,&child)) {
+        MessageBoxW(owner,L"无法打开设置窗口。请重新安装 EZFolder。",L"EZFolder",MB_OK|MB_ICONERROR);
+        return;
+    }
+    settingsProcess=child.hProcess;
+    CloseHandle(child.hThread);
+}
+void drawMenuCommand(const DRAWITEMSTRUCT& d,UINT dpi) {
+    bool selected=(d.itemState & ODS_SELECTED)!=0;
+    int saved=SaveDC(d.hDC);
+    auto px=[dpi](int n){ return MulDiv(n,dpi,96); };
+    SetDCBrushColor(d.hDC,selected ? RGB(65,65,65) : RGB(43,43,43));
+    auto brush=static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    FillRect(d.hDC,&d.rcItem,brush);
+    RECT gutter=d.rcItem;
+    gutter.left+=px(23);
+    gutter.right=gutter.left+1;
+    SetDCBrushColor(d.hDC,RGB(70,70,70));
+    FillRect(d.hDC,&gutter,brush);
+    RECT label=d.rcItem;
+    label.left=gutter.right+px(8);
+    SetTextColor(d.hDC,RGB(246,246,246));
+    SetBkMode(d.hDC,TRANSPARENT);
+    DrawTextW(d.hDC,L"设置",-1,&label,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+    RestoreDC(d.hDC,saved);
+}
 LRESULT CALLBACK buttonProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR, DWORD_PTR data) {
     Entry& e = *reinterpret_cast<Entry*>(data);
+    if (m==WM_MEASUREITEM) {
+        auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(b);
+        if (item->CtlType==ODT_MENU) {
+            item->itemWidth=MulDiv(150,dpiOf(w),96);
+            item->itemHeight=MulDiv(24,dpiOf(w),96);
+            return TRUE;
+        }
+    }
+    if (m==WM_DRAWITEM) {
+        auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(b);
+        if (item->CtlType==ODT_MENU) { drawMenuCommand(*item,dpiOf(w)); return TRUE; }
+    }
+    if (m == WM_CONTEXTMENU) {
+        POINT pt{static_cast<short>(LOWORD(b)),static_cast<short>(HIWORD(b))};
+        if (pt.x == -1 && pt.y == -1) {
+            RECT r{};
+            GetWindowRect(w,&r);
+            pt = {r.left,r.bottom};
+        }
+        HMENU menu=CreatePopupMenu();
+        if (!menu) return 0;
+        HBRUSH bg=dark && !highContrast ? CreateSolidBrush(RGB(43,43,43)) : nullptr;
+        MENUITEMINFOW item{};
+        item.cbSize=sizeof(item);
+        item.fMask=MIIM_ID|MIIM_STRING|MIIM_FTYPE;
+        item.wID=settingsCommand;
+        item.dwTypeData=const_cast<wchar_t*>(L"设置");
+        MSAAMENUINFO accessible{MSAA_MENU_SIG,2,item.dwTypeData};
+        if (bg) {
+            MENUINFO info{};
+            info.cbSize=sizeof(info);
+            info.fMask=MIM_BACKGROUND;
+            info.hbrBack=bg;
+            SetMenuInfo(menu,&info);
+            item.fType=MFT_OWNERDRAW;
+            item.fMask|=MIIM_DATA;
+            item.dwItemData=reinterpret_cast<ULONG_PTR>(&accessible);
+        }
+        UINT choice=0;
+        HWND owner=GetAncestor(w,GA_ROOT);
+        if (InsertMenuItemW(menu,0,TRUE,&item))
+            choice=TrackPopupMenuEx(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,w,nullptr);
+        DestroyMenu(menu);
+        if (bg) DeleteObject(bg);
+        if (choice==settingsCommand && IsWindow(owner)) openSettings(owner);
+        return 0;
+    }
     if (m == WM_MOUSEMOVE && !e.hot) {
         e.hot = true;
         TRACKMOUSEEVENT ev{sizeof(ev),TME_LEAVE,w,0}; TrackMouseEvent(&ev);
@@ -159,11 +267,11 @@ LRESULT CALLBACK entryProc(HWND w, UINT m, WPARAM a, LPARAM b) {
         e->button = CreateWindowExW(0,L"BUTTON",action(false),WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
             0,0,1,1,w,reinterpret_cast<HMENU>(1),instance,nullptr);
         if (!e->button || !SetWindowSubclass(e->button,buttonProc,1,reinterpret_cast<DWORD_PTR>(e))) return -1;
-        e->tooltip = CreateWindowExW(WS_EX_TOOLWINDOW,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+        e->tooltip = CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
             0,0,0,0,w,nullptr,instance,nullptr);
         if (e->tooltip) {
-            TOOLINFOW t{}; t.cbSize=sizeof(t); t.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
-            t.hwnd=w; t.uId=reinterpret_cast<UINT_PTR>(e->button); t.lpszText=const_cast<wchar_t*>(action(false));
+            TOOLINFOW t{}; t.cbSize=TTTOOLINFOW_V2_SIZE; t.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
+            t.hwnd=w; t.uId=reinterpret_cast<UINT_PTR>(e->button); t.lpszText=const_cast<wchar_t*>(tipText);
             SendMessageW(e->tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&t));
         }
         return 0;
@@ -233,8 +341,9 @@ BOOL CALLBACK place(HWND root, LPARAM themeChanged) {
     if (!IsWindowVisible(w) || actual.left!=x || actual.top!=y || actual.right-actual.left!=width ||
         actual.bottom-actual.top!=height || GetWindow(dock,GW_CHILD)!=w)
         SetWindowPos(w,HWND_TOP,x,y,width,height,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-    if (dpi!=e->dpi) {
+    if (dpi!=e->dpi || themeChanged) {
         e->dpi=dpi;
+        styleTooltip(*e);
         InvalidateRect(e->button,nullptr,FALSE);
     }
     bool on=bandVisible(root);
@@ -252,7 +361,12 @@ void refresh() {
     EnumWindows(place,changed);
 }
 LRESULT CALLBACK managerProc(HWND w,UINT m,WPARAM a,LPARAM b) {
-    if (m==WM_TIMER) { refresh(); return 0; }
+    if (m==WM_TIMER) {
+        refresh();
+        if (pendingSettingsOwner && IsWindow(pendingSettingsOwner)) openSettings(pendingSettingsOwner);
+        else pendingSettingsOwner=nullptr;
+        return 0;
+    }
     if (m==toggleMessage) {
         HWND host=reinterpret_cast<HWND>(a);
         DWORD pid=0;
@@ -290,8 +404,12 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,LPWSTR args,int) {
     if(manager && SetTimer(manager,1,300,nullptr)){
         refresh();
         MSG msg{};
-        while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
+        while(GetMessageW(&msg,nullptr,0,0)>0){
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
+    if (settingsProcess) CloseHandle(settingsProcess);
     OleUninitialize();
     CloseHandle(mutex);
     return 0;

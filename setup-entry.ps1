@@ -5,15 +5,22 @@ $startup = [Environment]::GetFolderPath('Startup')
 $shortcut = Join-Path $startup 'EZFolder Ribbon Entry.lnk'
 $session = (Get-Process -Id $PID).SessionId
 $prefix = 'EZFolderEntry-'
-$installedName = '^EZFolderEntry-[a-f0-9]{64}\.exe$'
+$installedName = '^EZFolder(?:Entry|Settings)-[a-f0-9]{64}\.exe$'
 $target = $null
 if (!$Uninstall) {
-    $source = (Get-Item -LiteralPath (Join-Path $PSScriptRoot 'build\EZFolderEntry.exe')).FullName
-    $hash = (Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant()
+    $entrySource = Join-Path $PSScriptRoot 'build\EZFolderEntry.exe'
+    $settingsSource = Join-Path $PSScriptRoot 'build\EZFolderSettings.exe'
+    $hashes = @((Get-FileHash -LiteralPath $entrySource).Hash,(Get-FileHash -LiteralPath $settingsSource).Hash)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $version = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes(($hashes -join '')))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
     [void][IO.Directory]::CreateDirectory($directory)
-    $target = Join-Path $directory "$prefix$hash.exe"
-    if (!(Test-Path -LiteralPath $target)) { [IO.File]::Copy($source,$target) }
-    if ((Get-FileHash -LiteralPath $target).Hash -ne $hash) { throw 'Ribbon entry checksum mismatch.' }
+    $target = Join-Path $directory "$prefix$version.exe"
+    $settingsTarget = Join-Path $directory "EZFolderSettings-$version.exe"
+    foreach ($pair in @(@($settingsSource,$settingsTarget,$hashes[1]),@($entrySource,$target,$hashes[0]))) {
+        if (!(Test-Path -LiteralPath $pair[1])) { [IO.File]::Copy($pair[0],$pair[1]) }
+        if ((Get-FileHash -LiteralPath $pair[1]).Hash -ne $pair[2]) { throw "Checksum mismatch: $($pair[1])" }
+    }
 }
 $running = @(Get-Process -Name 'EZFolderEntry-*' -ErrorAction SilentlyContinue | Where-Object {
     $_.SessionId -eq $session -and $_.Path -and [IO.Path]::GetDirectoryName($_.Path) -eq $directory -and
@@ -47,7 +54,7 @@ if ($Uninstall) {
     Write-Output "Ribbon entry installed: $target"
 }
 if (Test-Path -LiteralPath $directory) {
-    Get-ChildItem -LiteralPath $directory -File | Where-Object { $_.Name -match $installedName -and $_.FullName -ne $target } | ForEach-Object {
+    Get-ChildItem -LiteralPath $directory -File | Where-Object { $_.Name -match $installedName -and $_.FullName -notin @($target,$settingsTarget) } | ForEach-Object {
         try { Remove-Item -LiteralPath $_.FullName -ErrorAction Stop }
         catch { Write-Warning "The ribbon entry file is still in use: $($_.Name)" }
     }
