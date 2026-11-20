@@ -37,12 +37,6 @@ class BandTheme {
             COLORREF ink = IsWindowEnabled(w) ? text : edge;
             line(dc,x-arm,y,x+arm+1,y,ink);
             line(dc,x,y-arm,x,y+arm+1,ink);
-            if (primary) {
-                int left=bounds.right-px(9),top=px(4);
-                line(dc,left,top,left+px(4),top,ink);
-                line(dc,left+px(1),top+px(1),left+px(1),top+px(6),ink);
-                line(dc,left,top+px(3),left+px(4),top+px(3),ink);
-            }
             if (focus) DrawFocusRect(dc,&r);
             return;
         }
@@ -92,7 +86,6 @@ class BandTheme {
     }
 public:
     int loading=-1;
-    bool primary=false;
     bool darkMenu() const { return background==RGB(0,0,0) && surface==RGB(48,48,48); }
     void menuItem(const DRAWITEMSTRUCT& item,int dpi) const {
         auto* data=reinterpret_cast<const MSAAMENUINFO*>(item.itemData);

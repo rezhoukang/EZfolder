@@ -396,12 +396,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (TabCtrl_GetCurSel(tabs) != shown) TabCtrl_SetCurSel(tabs,shown);
         EnableWindow(tabs, destination < 0 && separating < 0);
         layout();
-        bool primary=GetPropW(bar,merge::primaryProp)!=nullptr;
-        if (theme.primary!=primary) {
-            theme.primary=primary;
-            SetWindowTextW(add,primary?L"新建标签页（主窗口）":L"新建标签页");
-            InvalidateRect(add,nullptr,FALSE);
-        }
         InvalidateRect(tabs, nullptr, FALSE);
     }
     int append(Location location, bool activate = true) {
