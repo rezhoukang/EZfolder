@@ -692,6 +692,28 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         schedule(25);
     }
     enum MenuCommand { Settings=200, Duplicate, NewWindow, Restore };
+    void restoreClosedTab() {
+        if (closed.empty() || !hasRoom() || destination>=0 || separating>=0 || incoming || queuedTab>=0 || storing) return;
+        pendingNew=append(Location(ILCloneFull(closed.back().get())),false);
+        if (pendingNew>=0) { restoring=true; select(pendingNew); }
+    }
+    static std::wstring restoreMenuLabel() {
+        std::wstring label=L"恢复上个关闭的标签页";
+        DWORD chord=settings::load().shortcuts[settings::Restore];
+        if (!chord) return label;
+        label+=L"\t";
+        if (chord & settings::control) label+=L"Ctrl+";
+        if (chord & settings::alt) label+=L"Alt+";
+        if (chord & settings::shift) label+=L"Shift+";
+        UINT vk=chord & 255;
+        if ((vk>='A' && vk<='Z') || (vk>='0' && vk<='9')) return label+wchar_t(vk);
+        wchar_t key[64]{};
+        UINT scan=MapVirtualKeyW(vk,MAPVK_VK_TO_VSC_EX);
+        LONG keyData=(scan & 255)<<16;
+        if (scan & 0xff00) keyData|=1<<24;
+        GetKeyNameTextW(keyData,key,64);
+        return label+key;
+    }
     void tabMenu(POINT point) {
         if (!tabs || !IsWindowVisible(bar)) return;
         sync();
@@ -708,7 +730,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         Location clicked(index>=0 ? ILCloneFull(folders[index].get()) : nullptr);
         HMENU menu=CreatePopupMenu();
         if (!menu) return;
-        const wchar_t* names[]={L"设置",L"复制此标签页",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
+        auto restoreLabel=restoreMenuLabel();
+        const wchar_t* names[]={L"设置",L"复制此标签页",L"在新窗口打开此标签页",restoreLabel.c_str()};
         bool enabled[]={true,idle && clicked && hasRoom(),idle && clicked,idle && hasRoom() && !closed.empty()};
         MSAAMENUINFO accessible[4]{};
         HBRUSH bg=theme.darkMenu()?CreateSolidBrush(RGB(43,43,43)):nullptr;
@@ -742,10 +765,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (choice==NewWindow && index>=0 && index<static_cast<int>(folders.size()) && clicked && ILIsEqual(clicked.get(),folders[index].get())) {
             RECT r{}; GetWindowRect(merge::frame(bar),&r);
             separate(index,{r.left+scale(96),r.top+scale(80)},true);
-        } else if (hasRoom() && (choice==Duplicate || (choice==Restore && !closed.empty()))) {
-            Location id=choice==Duplicate ? std::move(clicked) : Location(ILCloneFull(closed.back().get()));
-            pendingNew=append(std::move(id),false);
-            if (pendingNew>=0) { restoring=choice==Restore; select(pendingNew); }
+        } else if (choice==Restore) {
+            restoreClosedTab();
+        } else if (choice==Duplicate && hasRoom()) {
+            pendingNew=append(std::move(clicked),false);
+            if (pendingNew>=0) select(pendingNew);
         }
     }
     static LRESULT CALLBACK hostMenuProc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
@@ -1007,6 +1031,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     bool runShortcut(int action) {
         if (action == settings::New) newTab();
         else if (action == settings::Close) closeTab(active);
+        else if (action == settings::Restore) restoreClosedTab();
         else if (!folders.empty() && (action == settings::Next || action == settings::Previous)) {
             int count = static_cast<int>(folders.size());
             select((active + (action == settings::Previous ? count-1 : 1)) % count);
@@ -1026,10 +1051,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                     while (self && self->bar != band) self = self->nextOnThread;
                     if (!self) return CallNextHookEx(nullptr,code,mode,data);
                     int action = self->shortcutFor(msg->wParam);
-                    if (action==settings::Close || (action>=0 && (msg->hwnd==self->tabs || msg->hwnd==self->add))) {
-                        bool repeatClose = action==settings::Close && (msg->lParam & (1L<<30));
+                    bool windowShortcut=action==settings::Close || action==settings::Restore;
+                    if (windowShortcut || (action>=0 && (msg->hwnd==self->tabs || msg->hwnd==self->add))) {
+                        bool repeat = windowShortcut && (msg->lParam & (1L<<30));
                         msg->hwnd=band;
-                        msg->message=repeatClose ? WM_NULL : shortcutMessage;
+                        msg->message=repeat ? WM_NULL : shortcutMessage;
                         msg->wParam=action;
                     }
                 }
@@ -1082,7 +1108,18 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         try {
             if (msg==WM_MEASUREITEM && lp) {
                 auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
-                if (item->CtlType==ODT_MENU) { item->itemWidth=self->scale(188); item->itemHeight=self->scale(26); return TRUE; }
+                if (item->CtlType==ODT_MENU) {
+                    auto* info=reinterpret_cast<const MSAAMENUINFO*>(item->itemData);
+                    HDC dc=GetDC(w);
+                    SIZE extent{};
+                    if (dc) {
+                        if (info) GetTextExtentPoint32W(dc,info->pszWText,info->cchWText,&extent);
+                        ReleaseDC(w,dc);
+                    }
+                    item->itemWidth=std::max(self->scale(188),int(extent.cx)+self->scale(58));
+                    item->itemHeight=self->scale(26);
+                    return TRUE;
+                }
             }
             if (msg==WM_DRAWITEM && lp) {
                 auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(lp);

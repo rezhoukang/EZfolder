@@ -6,9 +6,9 @@ using Forms = System.Windows.Forms;
 sealed class ShortcutEditor : Forms.IMessageFilter {
     const string RegistryPath = @"Software\EZFolder";
     const int Ctrl=0x100, Shift=0x200, Alt=0x400;
-    static readonly int[] Defaults = {Ctrl|'T',Ctrl|'W',Ctrl|9,Ctrl|Shift|9};
-    public static readonly string[] Names = {"新建标签页","关闭当前标签","下一个标签","上一个标签"};
-    public const string Hint = "关闭标签页在当前资源管理器窗口内生效，其他快捷键在标签栏内生效。点击按键组合即可修改。";
+    static readonly int[] Defaults = {Ctrl|'T',Ctrl|'W',Ctrl|9,Ctrl|Shift|9,Ctrl|Shift|'T'};
+    public static readonly string[] Names = {"新建标签页","关闭当前标签","下一个标签","上一个标签","恢复上个关闭的标签页"};
+    public const string Hint = "关闭和恢复标签页在当前资源管理器窗口内生效，其他快捷键在标签栏内生效。点击按键组合即可修改。";
     readonly int[] shortcuts = (int[])Defaults.Clone();
     public bool QuickAccess;
     public int Recording { get; private set; }
@@ -22,16 +22,17 @@ sealed class ShortcutEditor : Forms.IMessageFilter {
         using (var key=Registry.CurrentUser.OpenSubKey(RegistryPath)) {
             if (key==null) return;
             var data=key.GetValue("PreferencesV1") as byte[];
-            if (data!=null && data.Length==20 && (uint)BitConverter.ToInt32(data,0)<=1) {
+            if (data!=null && (data.Length==20 || data.Length==(shortcuts.Length+1)*4) && (uint)BitConverter.ToInt32(data,0)<=1) {
                 QuickAccess=BitConverter.ToInt32(data,0)==1;
-                Buffer.BlockCopy(data,4,shortcuts,0,16);
+                Buffer.BlockCopy(data,4,shortcuts,0,data.Length-4);
+                if (data.Length==20 && Array.IndexOf(shortcuts,shortcuts[4],0,4)>=0) shortcuts[4]=0;
             } else QuickAccess=object.Equals(key.GetValue("NewTabLocation"),1);
         }
     }
     public bool Save(Forms.Form owner,bool quick) {
-        var data=new byte[20];
+        var data=new byte[(shortcuts.Length+1)*4];
         data[0]=(byte)(quick ? 1 : 0);
-        Buffer.BlockCopy(shortcuts,0,data,4,16);
+        Buffer.BlockCopy(shortcuts,0,data,4,shortcuts.Length*4);
         try {
             using (var key=Registry.CurrentUser.CreateSubKey(RegistryPath))
                 key.SetValue("PreferencesV1",data,RegistryValueKind.Binary);
@@ -41,6 +42,7 @@ sealed class ShortcutEditor : Forms.IMessageFilter {
     public string Caption(int i) {
         if (Recording==i) return "请按快捷键…";
         int chord=shortcuts[i], vk=chord&255;
+        if (chord==0) return "未设置";
         string key=vk>='0' && vk<='9' ? ((char)vk).ToString() : ((Forms.Keys)vk).ToString();
         return ((chord&Ctrl)!=0 ? "Ctrl + " : "") + ((chord&Alt)!=0 ? "Alt + " : "") +
                ((chord&Shift)!=0 ? "Shift + " : "") + key;

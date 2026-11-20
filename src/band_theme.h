@@ -105,7 +105,12 @@ public:
         r.left+=MulDiv(8,dpi,96);
         SetTextColor(item.hDC,item.itemState&ODS_DISABLED ? GetSysColor(COLOR_GRAYTEXT) : text);
         SetBkMode(item.hDC,TRANSPARENT);
-        DrawTextW(item.hDC,data->pszWText,-1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        const wchar_t* split=wcschr(data->pszWText,L'\t');
+        DrawTextW(item.hDC,data->pszWText,split ? int(split-data->pszWText) : -1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        if (split) {
+            r.right-=MulDiv(10,dpi,96);
+            DrawTextW(item.hDC,split+1,-1,&r,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        }
         RestoreDC(item.hDC,saved);
     }
     static RECT closeRect(RECT r, int dpi, bool hot) {

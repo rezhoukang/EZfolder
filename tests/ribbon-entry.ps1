@@ -83,6 +83,13 @@ public static class RibbonEntryTest {
     struct GuiInfo { public int size,flags; public IntPtr active,focus,capture,menu,move,caret; public Rect rect; }
     [DllImport("user32")] static extern bool GetGUIThreadInfo(uint thread,ref GuiInfo info);
     public static bool Focused(IntPtr w) { var g=new GuiInfo();g.size=Marshal.SizeOf(g);return GetGUIThreadInfo(0,ref g)&&g.focus==w; }
+    [DllImport("user32")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32")] static extern void keybd_event(byte key,byte scan,uint flags,UIntPtr extra);
+    public static void RestoreShortcut(IntPtr root,IntPtr tabs) {
+        if(GetForegroundWindow()!=root || Focused(tabs)) throw new Exception("Expected focus in the Explorer window outside the tab strip.");
+        foreach(byte key in new byte[]{17,16,84}) keybd_event(key,0,0,UIntPtr.Zero);
+        foreach(byte key in new byte[]{84,16,17}) keybd_event(key,0,2,UIntPtr.Zero);
+    }
     public static IntPtr SettingsDialog(IntPtr button) {
         uint owner,pid;
         GetWindowThreadProcessId(button,out owner);
@@ -210,6 +217,12 @@ function Test-TabActions {
         $dpi=[RibbonEntryTest]::GetDpiForWindow($tabs)
         [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
         Wait-For 'tab closed' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        [RibbonEntryTest]::RestoreShortcut($root,$tabs)
+        Wait-For 'Ctrl+Shift+T restored closed directory' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $child -and [RibbonEntryTest]::IsWindowEnabled($tabs)
+        } | Out-Null
+        [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
+        Wait-For 'restored tab closed again' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
         Pick-Action $tabs 4
         Wait-For 'restored closed directory' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $child } | Out-Null
         Pick-Action $tabs 3
@@ -290,7 +303,7 @@ function Test-SettingsMenu {
     try {
         $settings.DeleteValue('NewTabLocation',$false)
         $settings.DeleteValue('PreferencesV1',$false)
-        $defaultKeys = @('Ctrl + T','Ctrl + W','Ctrl + Tab','Ctrl + Shift + Tab')
+        $defaultKeys = @('Ctrl + T','Ctrl + W','Ctrl + Tab','Ctrl + Shift + Tab','Ctrl + Shift + T')
         foreach ($action in @('Cancel','Customize','CancelReset','Reset')) {
             [void][RibbonEntryTest]::SetForegroundWindow($root)
             Wait-For "entry ready for right-click ($action)" { Test-Placement } | Out-Null
@@ -305,8 +318,8 @@ function Test-SettingsMenu {
             $reset = $action -in @('Reset','CancelReset')
             $current = if ($reset) { 'QuickAccess' } else { 'ThisPC' }
             if (!(SettingControl $current).GetCurrentPattern($selection).Current.IsSelected) { throw 'Dialog did not load the saved setting.' }
-            for ($k=0;$k -lt 4;$k++) {
-                $expected = if ($reset -and $k -eq 0) { 'F6' } else { $defaultKeys[$k] }
+            for ($k=0;$k -lt $defaultKeys.Count;$k++) {
+                $expected = if ($reset -and $k -eq 0) { 'F6' } elseif ($reset -and $k -eq 4) { 'F8' } else { $defaultKeys[$k] }
                 if (!(SettingControl "Binding$k").Current.Name.EndsWith($expected)) { throw "Wrong shortcut for action $k" }
             }
             if ($reset) {
@@ -325,6 +338,10 @@ function Test-SettingsMenu {
                 Wait-For 'duplicate rejected' { (SettingControl 'ShortcutHint').Current.Name.Contains('已用于') } | Out-Null
                 [RibbonEntryTest]::Stroke($dialog,27)
                 Wait-For 'Escape restored old chord' { (SettingControl 'Binding1').Current.Name.EndsWith($defaultKeys[1]) } | Out-Null
+                (SettingControl 'Binding4').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+                Wait-For 'restore shortcut capture' { (SettingControl 'Binding4').Current.Name.Contains('请按快捷键') } | Out-Null
+                [RibbonEntryTest]::Stroke($dialog,0x77)
+                Wait-For 'restore rebound to F8' { (SettingControl 'Binding4').Current.Name.EndsWith('F8') } | Out-Null
             }
             $commit = if ($action.StartsWith('Cancel')) { 'Cancel' } else { 'Save' }
             (SettingControl $commit).GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
@@ -335,6 +352,8 @@ function Test-SettingsMenu {
             } else {
                 $quick = [int]($action -ne 'Reset')
                 $newKey = if ($quick) { 0x75 } else { 0x154 }
+                $restoreKey = if ($quick) { 0x77 } else { 0x354 }
+                if ($blob.Length -ne 24 -or [BitConverter]::ToInt32($blob,20) -ne $restoreKey) { throw 'Incorrect saved restore binding.' }
                 if ([BitConverter]::ToInt32($blob,0) -ne $quick -or [BitConverter]::ToInt32($blob,4) -ne $newKey) { throw "Incorrect saved $action settings." }
                 if ($action -eq 'CancelReset') { continue }
                 $bar = [FixtureWindow]::GetProp($root,'EZFolder.Band.2')
@@ -359,7 +378,7 @@ function Test-SettingsMenu {
                 Wait-For 'changed hotkey opens a Quick Access tab' { [RibbonEntryTest]::TabCount($tabs) -eq $count+1 -and $window.Document.Folder.Self.Path -match '679f85cb' } | Out-Null
             }
         }
-        'PASS: four bindings, capture, conflict detection, Escape, live rebinding, reset, save and cancel.'
+        'PASS: five bindings, capture, conflict detection, Escape, live rebinding, reset, save and cancel.'
     } finally {
         if ($popup -ne [IntPtr]::Zero) { [RibbonEntryTest]::Key($popup,0x1b); [RibbonEntryTest]::Key($popup,0x1b) }
         $dialog = [RibbonEntryTest]::SettingsDialog($button)

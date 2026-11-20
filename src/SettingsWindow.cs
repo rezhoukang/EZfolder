@@ -92,7 +92,7 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         Forms.Application.AddMessageFilter(this);
         using (var graphics = CreateGraphics())
             ClientSize = new Size(Math.Min(work.Width-20,(int)Math.Ceiling(416*graphics.DpiX/96)),
-                Math.Min(work.Height-64,(int)Math.Ceiling(486*graphics.DpiY/96)));
+                Math.Min(work.Height-64,(int)Math.Ceiling(526*graphics.DpiY/96)));
         Location = new Point(work.Left+(work.Width-Width)/2, work.Top+(work.Height-Height)/2);
         Shown += delegate { (quick.IsChecked == true ? quick : pc).Focus(FocusState.Programmatic); };
     }
