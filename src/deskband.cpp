@@ -691,23 +691,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         pendingNew=append(Location(ILCloneFull(closed.back().get())),false);
         if (pendingNew>=0) { restoring=true; select(pendingNew); }
     }
-    static std::wstring restoreMenuLabel() {
-        std::wstring label=L"恢复上个关闭的标签页";
-        DWORD chord=settings::load().shortcuts[settings::Restore];
-        if (!chord) return label;
-        label+=L"\t";
-        if (chord & settings::control) label+=L"Ctrl+";
-        if (chord & settings::alt) label+=L"Alt+";
-        if (chord & settings::shift) label+=L"Shift+";
-        UINT vk=chord & 255;
-        if ((vk>='A' && vk<='Z') || (vk>='0' && vk<='9')) return label+wchar_t(vk);
-        wchar_t key[64]{};
-        UINT scan=MapVirtualKeyW(vk,MAPVK_VK_TO_VSC_EX);
-        LONG keyData=(scan & 255)<<16;
-        if (scan & 0xff00) keyData|=1<<24;
-        GetKeyNameTextW(keyData,key,64);
-        return label+key;
-    }
     void tabMenu(POINT point) {
         if (!tabs || !IsWindowVisible(bar)) return;
         sync();
@@ -724,8 +707,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         Location clicked(index>=0 ? ILCloneFull(folders[index].get()) : nullptr);
         HMENU menu=CreatePopupMenu();
         if (!menu) return;
-        auto restoreLabel=restoreMenuLabel();
-        const wchar_t* names[]={L"设置",L"复制此标签页",L"在新窗口打开此标签页",restoreLabel.c_str()};
+        const wchar_t* names[]={L"设置",L"复制此标签页",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
         bool enabled[]={true,idle && clicked && hasRoom(),idle && clicked,idle && hasRoom() && !closed.empty()};
         MSAAMENUINFO accessible[4]{};
         HBRUSH bg=theme.darkMenu()?CreateSolidBrush(RGB(43,43,43)):nullptr;
@@ -1103,14 +1085,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             if (msg==WM_MEASUREITEM && lp) {
                 auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
                 if (item->CtlType==ODT_MENU) {
-                    auto* info=reinterpret_cast<const MSAAMENUINFO*>(item->itemData);
-                    HDC dc=GetDC(w);
-                    SIZE extent{};
-                    if (dc) {
-                        if (info) GetTextExtentPoint32W(dc,info->pszWText,info->cchWText,&extent);
-                        ReleaseDC(w,dc);
-                    }
-                    item->itemWidth=std::max(self->scale(188),int(extent.cx)+self->scale(58));
+                    item->itemWidth=self->scale(188);
                     item->itemHeight=self->scale(26);
                     return TRUE;
                 }
