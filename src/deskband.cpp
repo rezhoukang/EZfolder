@@ -62,6 +62,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static constexpr UINT importMessage = WM_APP + 27;
     static constexpr UINT refreshMessage = WM_APP + 28;
     static constexpr UINT separateMessage = WM_APP + 29;
+    static constexpr UINT shortcutMessage = WM_APP + 30;
+    HHOOK focusedKeys = nullptr;
+    inline static thread_local Band* focusedBand = nullptr;
     HWND incoming = nullptr;
     HWND awaitingAck = nullptr;
     LPARAM incomingBirth = 0;
@@ -568,16 +571,42 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             RedrawWindow(bar,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
         }
     }
-    bool key(WPARAM vk) {
-        if (separating >= 0) return false;
-        if (!(GetKeyState(VK_CONTROL) & 0x8000) || (GetKeyState(VK_MENU) & 0x8000)) return false;
-        if (vk == 'T') newTab();
-        else if (vk == 'W') closeTab(active);
-        else if (vk == VK_TAB && !folders.empty()) {
+    int shortcutFor(WPARAM vk) const {
+        if (separating >= 0 || ((GetKeyState(VK_LWIN)|GetKeyState(VK_RWIN)) & 0x8000)) return -1;
+        DWORD chord = static_cast<DWORD>(vk);
+        if (GetKeyState(VK_CONTROL) & 0x8000) chord |= settings::control;
+        if (GetKeyState(VK_SHIFT) & 0x8000) chord |= settings::shift;
+        if (GetKeyState(VK_MENU) & 0x8000) chord |= settings::alt;
+        if (chord == vk && (vk < VK_F1 || vk > VK_F24)) return -1;
+        auto prefs = settings::load();
+        for (int i=0; i<settings::ActionCount; ++i) if (prefs.shortcuts[i]==chord) return i;
+        return -1;
+    }
+    bool runShortcut(int action) {
+        if (action == settings::New) newTab();
+        else if (action == settings::Close) closeTab(active);
+        else if (!folders.empty() && (action == settings::Next || action == settings::Previous)) {
             int count = static_cast<int>(folders.size());
-            select((active + ((GetKeyState(VK_SHIFT) & 0x8000) ? count - 1 : 1)) % count);
+            select((active + (action == settings::Previous ? count-1 : 1)) % count);
         } else return false;
         return true;
+    }
+    // Explorer translates accelerators such as F6 before DispatchMessage. Only route
+    // matching keydowns addressed to our own focused child on this UI thread.
+    static LRESULT CALLBACK focusedMessage(int code,WPARAM mode,LPARAM data) {
+        if (code==HC_ACTION && mode==PM_REMOVE) {
+            auto* msg=reinterpret_cast<MSG*>(data);
+            if ((msg->message==WM_KEYDOWN || msg->message==WM_SYSKEYDOWN) && focusedBand &&
+                (msg->hwnd==focusedBand->tabs || msg->hwnd==focusedBand->add) && msg->hwnd==GetFocus()) {
+                int action=focusedBand->shortcutFor(msg->wParam);
+                if (action>=0) { msg->message=shortcutMessage; msg->wParam=action; }
+            }
+        }
+        return CallNextHookEx(nullptr,code,mode,data);
+    }
+    void releaseFocusedKeys() {
+        if (focusedBand==this) focusedBand=nullptr;
+        if (focusedKeys) { UnhookWindowsHookEx(focusedKeys); focusedKeys=nullptr; }
     }
     static LRESULT CALLBACK childProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
@@ -603,7 +632,13 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 self->closeTab(TabCtrl_HitTest(w, &hit));
                 return 0;
             }
-            if (msg == WM_KEYDOWN && self->key(wp)) return 0;
+            if (msg==shortcutMessage) { if (w==GetFocus()) self->runShortcut(static_cast<int>(wp)); return 0; }
+            if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && self->runShortcut(self->shortcutFor(wp))) return 0;
+            if (msg==WM_KILLFOCUS || msg==WM_NCDESTROY) self->releaseFocusedKeys();
+            if (msg==WM_SETFOCUS && !self->focusedKeys) {
+                self->focusedKeys=SetWindowsHookExW(WH_GETMESSAGE,focusedMessage,nullptr,GetCurrentThreadId());
+                if (self->focusedKeys) focusedBand=self;
+            }
             if ((msg == WM_SETFOCUS || msg == WM_KILLFOCUS) && self->site.p) {
                 Com<IInputObjectSite> input;
                 if (SUCCEEDED(self->site->QueryInterface(IID_PPV_ARGS(&input.p))))
@@ -736,6 +771,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return schedule(settled ? 500 : 25) ? S_OK : E_FAIL;
     }
     void detach() {
+        releaseFocusedKeys();
         settle();
         presentation.finish();
         incoming = nullptr;
@@ -815,8 +851,8 @@ public:
     STDMETHODIMP UIActivateIO(BOOL on, MSG*) override { if (on && tabs) SetFocus(tabs); return S_OK; }
     STDMETHODIMP HasFocusIO() override { HWND w = GetFocus(); return bar && (w == bar || IsChild(bar,w)) ? S_OK : S_FALSE; }
     STDMETHODIMP TranslateAcceleratorIO(MSG* m) override {
-        if (!m || m->message != WM_KEYDOWN || HasFocusIO() != S_OK) return S_FALSE;
-        try { return key(m->wParam) ? S_OK : S_FALSE; } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+        if (!m || (m->message != WM_KEYDOWN && m->message != WM_SYSKEYDOWN) || HasFocusIO() != S_OK) return S_FALSE;
+        try { return runShortcut(shortcutFor(m->wParam)) ? S_OK : S_FALSE; } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
     }
     STDMETHODIMP GetClassID(CLSID* out) override { if (!out) return E_POINTER; *out = clsid; return S_OK; }
     STDMETHODIMP IsDirty() override { return S_FALSE; }

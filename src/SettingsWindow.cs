@@ -3,7 +3,6 @@ using System.Drawing;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using Microsoft.Win32;
 using ApiInformation = Windows.Foundation.Metadata.ApiInformation;
 using Windows.UI.ViewManagement;
 using Windows.UI.Xaml;
@@ -37,6 +36,7 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
     readonly Controls.Grid page;
     readonly UISettings system = new UISettings();
     readonly IntPtr island;
+    readonly ShortcutEditor editor = new ShortcutEditor();
 
     public SettingsWindow(IntPtr owner) {
         Text = "EZFolder 设置";
@@ -55,17 +55,44 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         source.Content = page;
         var pc = (Controls.RadioButton)page.FindName("ThisPC");
         var quick = (Controls.RadioButton)page.FindName("QuickAccess");
-        quick.IsChecked = SettingsProgram.QuickAccess();
+        quick.IsChecked = editor.QuickAccess;
         pc.IsChecked = quick.IsChecked != true;
+        var rows=(Controls.StackPanel)page.FindName("Shortcuts");
+        var hint=(Controls.TextBlock)page.FindName("ShortcutHint");
+        var keys=new Controls.Button[ShortcutEditor.Names.Length];
+        for (int i=0;i<keys.Length;i++) {
+            int index=i;
+            var row=new Controls.Grid { Margin=new Thickness(0,2,0,2) };
+            row.ColumnDefinitions.Add(new Controls.ColumnDefinition());
+            row.ColumnDefinitions.Add(new Controls.ColumnDefinition { Width=GridLength.Auto });
+            row.Children.Add(new Controls.TextBlock {Text=ShortcutEditor.Names[i],VerticalAlignment=VerticalAlignment.Center});
+            var button=new Controls.Button { MinWidth=156,HorizontalAlignment=HorizontalAlignment.Stretch };
+            Windows.UI.Xaml.Automation.AutomationProperties.SetAutomationId(button,"Binding"+i);
+            button.Click+=delegate { editor.Begin(index); };
+            button.LostFocus+=delegate { if (editor.Recording==index) editor.CancelCapture(); };
+            Windows.UI.Xaml.Controls.Grid.SetColumn(button,1);
+            row.Children.Add(button); rows.Children.Add(row); keys[i]=button;
+        }
+        Action refresh=delegate {
+            hint.Text=editor.HintText;
+            for(int i=0;i<keys.Length;i++) {
+                keys[i].Content=editor.Caption(i);
+                Windows.UI.Xaml.Automation.AutomationProperties.SetName(keys[i],ShortcutEditor.Names[i]+"，"+editor.Caption(i));
+            }
+        };
+        editor.Changed+=refresh;
+        refresh();
+        ((Controls.Button)page.FindName("Reset")).Click+=delegate { editor.Reset(); pc.IsChecked=true; };
         ((Controls.Button)page.FindName("Save")).Click += delegate {
-            if (SettingsProgram.Save(this,quick.IsChecked == true)) Close();
+            if (editor.Save(this,quick.IsChecked == true)) Close();
         };
         ((Controls.Button)page.FindName("Cancel")).Click += delegate { Close(); };
         ApplyTheme();
         system.ColorValuesChanged += ColorsChanged;
         Forms.Application.AddMessageFilter(this);
         using (var graphics = CreateGraphics())
-            ClientSize = new Size((int)Math.Ceiling(380*graphics.DpiX/96), (int)Math.Ceiling(250*graphics.DpiY/96));
+            ClientSize = new Size(Math.Min(work.Width-20,(int)Math.Ceiling(416*graphics.DpiX/96)),
+                Math.Min(work.Height-64,(int)Math.Ceiling(486*graphics.DpiY/96)));
         Location = new Point(work.Left+(work.Width-Width)/2, work.Top+(work.Height-Height)/2);
         Shown += delegate { (quick.IsChecked == true ? quick : pc).Focus(FocusState.Programmatic); };
     }
@@ -86,6 +113,7 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
     }
     public bool PreFilterMessage(ref Forms.Message m) {
         if (m.Msg < 0x100 || m.Msg > 0x109) return false;
+        if (editor.PreFilterMessage(ref m)) return true;
         if (m.Msg == 0x100 && m.WParam.ToInt32() == 27) { Close(); return true; }
         var msg = new NativeMessage { hwnd=m.HWnd, message=(uint)m.Msg, wParam=m.WParam, lParam=m.LParam };
         bool handled;
@@ -105,20 +133,6 @@ static class SettingsProgram {
         public IntPtr Handle { get; private set; }
         public ExplorerOwner(IntPtr handle) { Handle=handle; }
     }
-    const string RegistryPath = @"Software\EZFolder";
-    public static bool QuickAccess() {
-        using (var key = Registry.CurrentUser.OpenSubKey(RegistryPath)) {
-            object saved = key == null ? null : key.GetValue("NewTabLocation");
-            return saved is int && (int)saved == 1;
-        }
-    }
-    public static bool Save(Forms.Form owner,bool quick) {
-        try {
-            using (var key = Registry.CurrentUser.CreateSubKey(RegistryPath))
-                key.SetValue("NewTabLocation",quick ? 1 : 0,RegistryValueKind.DWord);
-            return true;
-        } catch (Exception ex) { Forms.MessageBox.Show(owner,ex.Message,owner.Text); return false; }
-    }
     static void RunIsland(IntPtr owner) {
         using (var manager = WindowsXamlManager.InitializeForCurrentThread())
         using (var window = new SettingsWindow(owner)) {
@@ -133,18 +147,35 @@ static class SettingsProgram {
             Font=SystemFonts.MessageBoxFont, MaximizeBox=false, MinimizeBox=false, AutoSize=true,
             AutoSizeMode=Forms.AutoSizeMode.GrowAndShrink, StartPosition=Forms.FormStartPosition.CenterScreen }) {
             var content=new Forms.FlowLayoutPanel { AutoSize=true, FlowDirection=Forms.FlowDirection.TopDown, Padding=new Forms.Padding(16) };
+            var editor=new ShortcutEditor();
             var pc=new Forms.RadioButton { Text="此电脑",AutoSize=true };
-            var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=QuickAccess() };
+            var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=editor.QuickAccess };
             pc.Checked=!quick.Checked;
             var buttons=new Forms.FlowLayoutPanel { AutoSize=true };
             var ok=new Forms.Button {Text="确定"};
             var cancel=new Forms.Button {Text="取消",DialogResult=Forms.DialogResult.Cancel};
-            ok.Click+=delegate { if (Save(form,quick.Checked)) form.Close(); };
-            buttons.Controls.AddRange(new Forms.Control[]{ok,cancel});
-            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,buttons});
+            ok.Click+=delegate { if (editor.Save(form,quick.Checked)) form.Close(); };
+            var reset=new Forms.Button { Text="重置默认值",AutoSize=true };
+            reset.Click+=delegate { editor.Reset(); pc.Checked=true; };
+            buttons.Controls.AddRange(new Forms.Control[]{ok,cancel,reset});
+            var hint=new Forms.Label {Text=ShortcutEditor.Hint,AutoSize=true};
+            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,
+                new Forms.Label {Text="快捷键",AutoSize=true},hint});
+            for (int i=0;i<ShortcutEditor.Names.Length;i++) {
+                int index=i;
+                var row=new Forms.FlowLayoutPanel {AutoSize=true};
+                var binding=new Forms.Button {Text=editor.Caption(i),Width=150};
+                binding.Click+=delegate {editor.Begin(index);};
+                binding.Leave+=delegate {if(editor.Recording==index) editor.CancelCapture();};
+                editor.Changed+=delegate {binding.Text=editor.Caption(index); hint.Text=editor.HintText;};
+                row.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text=ShortcutEditor.Names[i]},binding});
+                content.Controls.Add(row);
+            }
+            content.Controls.Add(buttons);
             form.Controls.Add(content);
             form.AcceptButton=ok; form.CancelButton=cancel;
-            form.ShowDialog();
+            Forms.Application.AddMessageFilter(editor);
+            try { form.ShowDialog(); } finally { Forms.Application.RemoveMessageFilter(editor); }
         }
     }
     [STAThread]

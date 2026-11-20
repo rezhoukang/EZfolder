@@ -114,6 +114,7 @@ $window = $null
 $testWindows = @()
 $settings = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\EZFolder')
 $prior = $settings.GetValue('NewTabLocation')
+$priorPreferences = $settings.GetValue('PreferencesV1')
 function Open-TestFolder($path) {
     if ($SeparateProcess) { Start-Process "$env:SystemRoot\explorer.exe" -ArgumentList "/separate,`"$path`"" -WindowStyle Normal }
     else { $shell.Explore($path) }
@@ -190,6 +191,7 @@ function Test-Density {
 }
 try {
     $settings.DeleteValue('NewTabLocation',$false)
+    $settings.DeleteValue('PreferencesV1',$false)
     $window = New-TestExplorer $folder -Separate:$SeparateProcess
     $null = Wait-For 'new Explorer test window' {
         $shell.Windows() | Where-Object { $_.Document.Folder.Self.Path -eq $folder } | Select-Object -First 1
@@ -308,6 +310,7 @@ try {
     if ($window) { $window.Quit() }
     if ($null -eq $prior) { $settings.DeleteValue('NewTabLocation',$false) }
     else { $settings.SetValue('NewTabLocation',$prior,[Microsoft.Win32.RegistryValueKind]::DWord) }
+    if ($null -ne $priorPreferences) { $settings.SetValue('PreferencesV1',$priorPreferences,[Microsoft.Win32.RegistryValueKind]::Binary) }
     $settings.Dispose()
     foreach ($path in ($burst + $measuredFolders)) { if (Test-Path -LiteralPath $path) { [IO.Directory]::Delete($path) } }
     if (Test-Path -LiteralPath $child) { [IO.Directory]::Delete($child) }

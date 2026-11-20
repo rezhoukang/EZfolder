@@ -16,7 +16,7 @@ try {
     $refs += foreach ($name in 'System.Runtime','System.Runtime.InteropServices.WindowsRuntime') {
         '/reference:' + (Get-ChildItem "$env:SystemRoot\Microsoft.NET\assembly\GAC_MSIL\$name\*\$name.dll" | Select-Object -First 1).FullName
     }
-    & "$framework\csc.exe" /nologo /target:winexe /platform:x64 /optimize+ /utf8output /codepage:65001 /out:build\EZFolderSettings.exe /win32manifest:src\settings.manifest /resource:src\settings.xaml,settings.xaml @refs /reference:System.Drawing.dll,System.Windows.Forms.dll,System.Runtime.WindowsRuntime.dll,System.Runtime.WindowsRuntime.UI.Xaml.dll src\SettingsWindow.cs
+    & "$framework\csc.exe" /nologo /target:winexe /platform:x64 /optimize+ /utf8output /codepage:65001 /out:build\EZFolderSettings.exe /win32manifest:src\settings.manifest /resource:src\settings.xaml,settings.xaml @refs /reference:System.Drawing.dll,System.Windows.Forms.dll,System.Runtime.WindowsRuntime.dll,System.Runtime.WindowsRuntime.UI.Xaml.dll src\SettingsWindow.cs src\ShortcutEditor.cs
     if ($LASTEXITCODE) { throw "Windows XAML settings build failed ($LASTEXITCODE)." }
     & $compiler -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -static -municode -mwindows -s src/ribbon_entry.cpp -o build/EZFolderEntry.exe -lcomctl32 -luxtheme -lole32 -loleaut32 -luuid -lgdi32 -luser32 -ladvapi32
     if ($LASTEXITCODE) { throw "Ribbon entry build failed ($LASTEXITCODE)." }
