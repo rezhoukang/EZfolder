@@ -76,6 +76,11 @@ constexpr wchar_t bandProp[] = L"EZFolder.Band.2";
 constexpr wchar_t fullProp[] = L"EZFolder.Full";
 constexpr wchar_t birthProp[] = L"EZFolder.Created.2";
 constexpr wchar_t offerProp[] = L"EZFolder.MergeTarget.2";
+constexpr wchar_t startingProp[] = L"EZFolder.Starting.3";
+constexpr wchar_t readyProp[] = L"EZFolder.Ready.3";
+inline UINT storeTab() { static UINT id = RegisterWindowMessageW(L"EZFolder.StoreTab.3"); return id; }
+inline UINT storedTab() { static UINT id = RegisterWindowMessageW(L"EZFolder.StoredTab.3"); return id; }
+inline UINT verifyName() { static UINT id = RegisterWindowMessageW(L"EZFolder.VerifyFolderName.3"); return id; }
 inline UINT request() { static UINT id = RegisterWindowMessageW(L"EZFolder.RequestTab.2"); return id; }
 inline UINT received() { static UINT id = RegisterWindowMessageW(L"EZFolder.ReceivedTab.2"); return id; }
 inline UINT retry() { static UINT id = RegisterWindowMessageW(L"EZFolder.RetryTab.2"); return id; }
@@ -90,23 +95,27 @@ inline bool live(HWND band) {
     HWND root = frame(band);
     return root && GetPropW(root, bandProp) == band && IsWindowVisible(band);
 }
-struct Search { HWND source; HWND result; };
+struct Search { HWND source; HWND result; bool includeDisabled; };
 inline BOOL CALLBACK olderWindow(HWND root, LPARAM data) {
     auto& s = *reinterpret_cast<Search*>(data);
     HWND candidate = static_cast<HWND>(GetPropW(root, bandProp));
-    if (!candidate || GetPropW(candidate,fullProp) || !live(candidate) || !IsWindowEnabled(root)) return TRUE;
+    if (!candidate || GetPropW(candidate,fullProp) || !live(candidate) || (!s.includeDisabled && !IsWindowEnabled(root))) return TRUE;
     DWORD cloaked = 0;
     if (SUCCEEDED(DwmGetWindowAttribute(root, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
     auto birth = reinterpret_cast<ULONG_PTR>(GetPropW(candidate, birthProp));
     auto own = reinterpret_cast<ULONG_PTR>(GetPropW(s.source, birthProp));
     if (birth < own || (birth == own && reinterpret_cast<UINT_PTR>(candidate) < reinterpret_cast<UINT_PTR>(s.source))) {
+        if (GetPropW(candidate, startingProp)) {
+            if (!s.result) s.result = candidate;
+            return TRUE;
+        }
         s.result = candidate;
         return FALSE;
     }
     return TRUE;
 }
-inline HWND target(HWND source) {
-    Search search{source, nullptr};
+inline HWND target(HWND source, bool includeDisabled = false) {
+    Search search{source, nullptr, includeDisabled};
     EnumWindows(olderWindow, reinterpret_cast<LPARAM>(&search));
     return search.result;
 }

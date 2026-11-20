@@ -73,8 +73,13 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     ULONGLONG opened = 0;
     Location offeredFolder;
     merge::LocalOffer localOffer;
+    std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> offeredName{nullptr,CoTaskMemFree};
+    bool storing = false;
+    int nextImported = -1;
+    ULONGLONG activateAfter = 0, firstImportedAt = 0;
     HWND confirming = nullptr;
     LPARAM confirmingBirth = 0;
+    bool confirmingStored = false, nameMatched = false;
     MergeVisibility presentation;
     bool closingMergedFrame = false;
 
@@ -90,6 +95,54 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             GetPropW(source, merge::offerProp) == bar &&
             reinterpret_cast<LPARAM>(GetPropW(source, merge::birthProp)) == birth;
     }
+    // Ordinary handoffs store a background tab. Only the final tab in a burst
+    // needs a shell view. Keep the older navigation handshake for older peers.
+    bool canStore(HWND source, LPARAM birth) const {
+        return settled && !closingMergedFrame && active >= 0 && !incoming && separating < 0 &&
+            IsWindowEnabled(merge::frame(bar)) && hasRoom() && validOffer(source,birth);
+    }
+    bool matchesOffer(HWND host, const COPYDATASTRUCT& packet) {
+        if (!offered || settled || !offeredName || packet.dwData != merge::verifyName() ||
+            !validSourceAck(host,reinterpret_cast<LPARAM>(GetPropW(bar,merge::birthProp)))) return false;
+        size_t bytes = (wcslen(offeredName.get())+1)*sizeof(wchar_t);
+        if (packet.cbData != bytes || !packet.lpData || memcmp(packet.lpData,offeredName.get(),bytes)) return false;
+        nameMatched = true;
+        return true;
+    }
+    bool storeOffer(HWND source, LPARAM birth) {
+        if (storing || !canStore(source,birth)) return false;
+        storing = true;
+        struct Reset { bool& busy; ~Reset() { busy = false; } } reset{storing};
+        Location id = merge::LocalOffer::read(source,bar,birth);
+        if (!id) {
+            // ShellWindows supplies the PIDL. Confirm its absolute name against the
+            // source snapshot, since the source can navigate while COM pumps messages.
+            id = merge::folderOf(source);
+            PWSTR name = nullptr;
+            if (!id || FAILED(SHGetNameFromIDList(id.get(),SIGDN_DESKTOPABSOLUTEPARSING,&name)) || !name) return false;
+            std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> owned(name,CoTaskMemFree);
+            COPYDATASTRUCT packet{merge::verifyName(),static_cast<DWORD>((wcslen(name)+1)*sizeof(wchar_t)),name};
+            DWORD_PTR matches = 0;
+            if (!SendMessageTimeoutW(source,WM_COPYDATA,reinterpret_cast<WPARAM>(bar),reinterpret_cast<LPARAM>(&packet),
+                                     SMTO_ABORTIFHUNG | SMTO_BLOCK,200,&matches) || !matches) return false;
+        }
+        if (!canStore(source,birth)) return false;
+        int index = append(std::move(id),false);
+        if (index < 0) return false;
+        merge::LocalOffer::confirm(source,bar,birth,folders[index].get());
+        if (!PostMessageW(source,merge::storedTab(),reinterpret_cast<WPARAM>(bar),birth)) {
+            erase(index);
+            controls();
+            return false;
+        }
+        auto now = GetTickCount64();
+        MergeVisibility::stored(bar,now);
+        if (nextImported < 0) firstImportedAt = now;
+        nextImported = index;
+        activateAfter = now+120;
+        schedule(25);
+        return true;
+    }
     void endImport(bool success) {
         if (!incoming) return;
         if (success && validOffer(incoming, incomingBirth)) {
@@ -102,7 +155,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         importIndex = -1;
     }
     LRESULT reserve(HWND source, LPARAM birth) {
-        if (!settled || active < 0 || destination >= 0 || incoming || !hasRoom() ||
+        if (!settled || storing || active < 0 || destination >= 0 || incoming || !hasRoom() ||
             (awaitingAck && GetPropW(awaitingAck, merge::offerProp) == bar) || separating >= 0 ||
             !validOffer(source, birth)) return 0;
         incoming = source;
@@ -133,10 +186,15 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     void settle() {
         if (!closingMergedFrame) presentation.finish();
         settled = true;
+        if (bar && !closingMergedFrame) {
+            SetPropW(bar,merge::readyProp,reinterpret_cast<HANDLE>(1));
+            RemovePropW(bar,merge::startingProp);
+        }
         confirming = nullptr;
         if (bar) RemovePropW(bar, merge::offerProp);
         localOffer.clear();
         offeredFolder.reset();
+        offeredName.reset();
     }
     bool hasSelection() {
         Com<IShellView> view;
@@ -152,23 +210,39 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (offered || active < 0 || !merge::live(bar)) return;
         HWND host = merge::target(bar);
         if (!host) {
-            presentation.finish();
             // Explorer briefly disables frames while it is creating a sibling.
-            if (GetTickCount64() - opened >= 250) settle();
+            if (HWND candidate = merge::target(bar,true)) presentation.begin(merge::frame(bar),candidate);
+            else if (GetTickCount64() - opened >= 250) settle();
             return;
         }
+        presentation.begin(merge::frame(bar),host);
+        if (GetPropW(host,merge::startingProp)) return;
         if (!offeredFolder || !ILIsEqual(offeredFolder.get(), folders[active].get())) {
             offeredFolder.reset(ILCloneFull(folders[active].get()));
             return;
         }
         if (hasSelection()) { settle(); return; }
         LPARAM birth = reinterpret_cast<LPARAM>(GetPropW(bar, merge::birthProp));
-        if (!localOffer.publish(bar, host, birth, offeredFolder.get())) {
+        bool local = localOffer.publish(bar, host, birth, offeredFolder.get());
+        bool modern = GetPropW(host,merge::readyProp) != nullptr;
+        nameMatched = false;
+        offeredName.reset();
+        if (!local && modern) {
+            PWSTR name = nullptr;
+            if (SUCCEEDED(SHGetNameFromIDList(offeredFolder.get(),SIGDN_DESKTOPABSOLUTEPARSING,&name))) offeredName.reset(name);
+            modern = offeredName != nullptr;
+        }
+        if (!local && !modern) {
             // The cross-process receiver reads the folder published by ShellWindows.
             Location published = merge::folderOf(bar);
             if (!published || !ILIsEqual(published.get(), offeredFolder.get())) return;
         }
         if (!SetPropW(bar, merge::offerProp, host)) { settle(); return; }
+        if (modern) {
+            offered = PostMessageW(host,merge::storeTab(),reinterpret_cast<WPARAM>(bar),birth) != FALSE;
+            if (!offered) RemovePropW(bar,merge::offerProp);
+            return;
+        }
         DWORD_PTR result = 0;
         if (!SendMessageTimeoutW(host, merge::request(), reinterpret_cast<WPARAM>(bar), birth,
                                  SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &result)) {
@@ -178,20 +252,22 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (result) offered = true;
         else RemovePropW(bar, merge::offerProp); // A concurrent transfer may own the target this tick.
     }
-    void received(HWND host, LPARAM birth) {
+    void received(HWND host, LPARAM birth, bool stored = false) {
         if (!offered || settled || !validSourceAck(host, birth)) return;
-        bool confirmedLocally = localOffer.confirmed();
+        bool confirmedLocally = localOffer.confirmed() || (stored && nameMatched);
+        if (stored && !confirmedLocally) return;
         Location landed = confirmedLocally ? Location{} : merge::folderOf(host);
         Location actual = current();
         HWND root = merge::frame(bar);
-        if (!root || !IsWindowEnabled(root) || folders.size() != 1 || !offeredFolder ||
+        if (!root || folders.size() != 1 || !offeredFolder ||
             (actual && !ILIsEqual(actual.get(), offeredFolder.get())) || hasSelection() || !validSourceAck(host, birth)) {
             settle();
             return;
         }
-        if (!actual || (!confirmedLocally && (!landed || !ILIsEqual(actual.get(), landed.get())))) {
+        if (!actual || !IsWindowEnabled(root) || (!confirmedLocally && (!landed || !ILIsEqual(actual.get(), landed.get())))) {
             confirming = host;
             confirmingBirth = birth;
+            confirmingStored = stored;
             schedule(25);
             return;
         }
@@ -220,9 +296,15 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         sync();
         checkSeparation();
         checkNewWindow();
-        if (confirming) received(confirming, confirmingBirth);
+        if (confirming) received(confirming, confirmingBirth, confirmingStored);
+        if (nextImported >= 0 && destination < 0 && !incoming && separating < 0 && now >= activateAfter &&
+            (!awaitingAck || GetPropW(awaitingAck,merge::offerProp) != bar)) {
+            if (now-firstImportedAt < 4000 && MergeVisibility::pending(bar)) activateAfter = now+80;
+            else select(nextImported);
+        }
         UINT period = 500;
-        if (separating >= 0 || confirming || destination >= 0 || (!settled && !offered))
+        if (nextImported >= 0) period = 25;
+        else if (separating >= 0 || confirming || destination >= 0 || (!settled && !offered))
             period = destination >= 0 || now - opened < 1000 ? 25 : 100;
         schedule(period);
     }
@@ -276,6 +358,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return index;
     }
     void erase(int index) {
+        if (index == nextImported) nextImported = -1;
+        else if (index < nextImported) --nextImported;
         TabCtrl_DeleteItem(tabs, index);
         folders.erase(folders.begin() + index);
         if (active > index) --active;
@@ -309,11 +393,13 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!actual) return;
         if (active < 0) append(std::move(actual));
         else if (!ILIsEqual(actual.get(), folders[active].get())) {
+            nextImported = -1;
             folders[active] = std::move(actual);
             label(active, false);
         }
     }
     void select(int index, bool removePrevious = false) {
+        nextImported = -1;
         if (destination >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
         sync();
         if (index == active || active < 0) return;
@@ -343,6 +429,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     void newTab(bool replaceLast = false) {
         if (destination >= 0 || separating >= 0 || incoming || (!replaceLast && !hasRoom())) return;
         settle();
+        nextImported = -1;
         sync();
         if (active < 0) return;
         PIDLIST_ABSOLUTE id = nullptr;
@@ -382,6 +469,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     void separate(int index, POINT drop) {
         if (destination >= 0 || separating >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
         settle();
+        nextImported = -1;
         HWND source = merge::frame(bar);
         if (folders.size() == 1) {
             if (IsZoomed(source)) ShowWindow(source,SW_RESTORE);
@@ -650,6 +738,17 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static LRESULT CALLBACK barProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
         try {
+            if (msg == WM_COPYDATA && lp) return self->matchesOffer(reinterpret_cast<HWND>(wp),*reinterpret_cast<COPYDATASTRUCT*>(lp));
+            if (msg == merge::storeTab() || msg == merge::storedTab()) {
+                Com<IDeskBand> guard;
+                self->AddRef();
+                guard.p = self;
+                HWND peer = reinterpret_cast<HWND>(wp);
+                if (msg == merge::storedTab()) self->received(peer,lp,true);
+                else if (!self->storeOffer(peer,lp) && self->validOffer(peer,lp))
+                    PostMessageW(peer,merge::retry(),reinterpret_cast<WPARAM>(w),lp);
+                return 0;
+            }
             if (msg == merge::request()) return self->reserve(reinterpret_cast<HWND>(wp), lp);
             if (msg == merge::retry()) {
                 if (self->validSourceAck(reinterpret_cast<HWND>(wp), lp)) {
@@ -735,8 +834,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         offered = false;
         closingMergedFrame = false;
         SetPropW(bar, merge::birthProp, reinterpret_cast<HANDLE>(opened + 1));
+        SetPropW(bar,settled ? merge::readyProp : merge::startingProp,reinterpret_cast<HANDLE>(1));
         if (root) SetPropW(root, merge::bandProp, bar);
-        if (!settled && merge::target(bar)) presentation.begin(root);
+        if (!settled) {
+            if (HWND candidate = merge::target(bar,true)) presentation.begin(root,candidate);
+        }
         auto child = [&](LPCWSTR type, LPCWSTR title, int id, DWORD style) {
             return CreateWindowExW(0, type, title, WS_VISIBLE | WS_CHILD | WS_TABSTOP | style,
                     0, 0, 0, 0, bar, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), module, nullptr);
@@ -777,6 +879,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         incoming = nullptr;
         awaitingAck = nullptr;
         importIndex = -1;
+        nextImported = -1;
         hideTitle();
         if (tooltip) DestroyWindow(tooltip);
         tooltip = nullptr;
