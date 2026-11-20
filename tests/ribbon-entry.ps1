@@ -1,4 +1,4 @@
-﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings)
+﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting)
 $ErrorActionPreference = 'Stop'
 Add-Type @'
 using System;
@@ -119,6 +119,40 @@ public static class RibbonEntryTest {
     }
     public static bool Shown(IntPtr root){return IsWindowVisible(GetProp(root,"EZFolder.Band.2"));}
     public static Rect Bounds(IntPtr w){Rect r;GetWindowRect(w,out r);return r;}
+    [DllImport("user32")] public static extern bool IsWindowEnabled(IntPtr w);
+    public static void NewTab(IntPtr bar) { PostMessage(bar,0x111,(IntPtr)100,IntPtr.Zero); }
+    [DllImport("user32")] static extern IntPtr GetAncestor(IntPtr w,uint flag);
+    public static void StatusMenu(IntPtr root,Point point) {
+        if(GetAncestor(WindowFromPoint(point),2)!=root) throw new Exception("Status bar is covered.");
+        SetCursorPos(point.X,point.Y);
+        mouse_event(8,0,0,0,UIntPtr.Zero);
+        mouse_event(16,0,0,0,UIntPtr.Zero);
+    }
+    public static void OpenItem(IntPtr root,Point point) {
+        if(GetAncestor(WindowFromPoint(point),2)!=root) throw new Exception("Folder item is covered.");
+        SetCursorPos(point.X,point.Y);
+        for (int i=0;i<2;++i) {
+            mouse_event(2,0,0,0,UIntPtr.Zero);
+            mouse_event(4,0,0,0,UIntPtr.Zero);
+            System.Threading.Thread.Sleep(40);
+        }
+    }
+    public static void Menu(IntPtr w) { PostMessage(w,0x7b,w,new IntPtr(-1)); }
+    public static void Mouse(IntPtr w,int message,int x,int y) {
+        IntPtr result;
+        if(SendMessageTimeout(w,message,(IntPtr)(message==0x201||message==0x200?1:0),(IntPtr)((y<<16)|(x&65535)),2,6000,out result)==IntPtr.Zero)
+            throw new Exception("Test window did not respond to mouse input");
+    }
+    public static bool DragTip(IntPtr bar) {
+        uint owner,pid; GetWindowThreadProcessId(bar,out owner);
+        for(IntPtr w=FindWindowEx(IntPtr.Zero,IntPtr.Zero,"tooltips_class32",null);w!=IntPtr.Zero;w=FindWindowEx(IntPtr.Zero,w,"tooltips_class32",null)) {
+            GetWindowThreadProcessId(w,out pid);
+            if(pid!=owner||!IsWindowVisible(w))continue;
+            var text=new StringBuilder(128);IntPtr result;
+            if(ReadText(w,13,(IntPtr)128,text,2,300,out result)!=IntPtr.Zero && text.ToString().Contains("合并"))return true;
+        }
+        return false;
+    }
     public static void Click(IntPtr button){
         IntPtr result;
         if(SendMessageTimeout(button,0xF5,IntPtr.Zero,IntPtr.Zero,2,3000,out result)==IntPtr.Zero)
@@ -143,6 +177,101 @@ function Test-Placement {
     return ([math]::Abs($dock.Right-$r.Right-$margin) -le 1 -and $r.Top -eq $dock.Top -and
         [RibbonEntryTest]::WindowFromPoint($point) -eq $button)
 }
+function Test-TabActions {
+    $shell=New-Object -ComObject Shell.Application
+    $bar=[FixtureWindow]::GetProp($root,'EZFolder.Band.2')
+    $tabs=[RibbonEntryTest]::GetDlgItem($bar,102)
+    function Pick-Action($surface,$position) {
+        if ($surface -eq $root) { [RibbonEntryTest]::StatusMenu($root,$point) }
+        else { [RibbonEntryTest]::Menu($surface) }
+        $popup=[IntPtr](Wait-For 'EZFolder commands' { [RibbonEntryTest]::SettingsPopup($tabs).ToInt64() })
+        [RibbonEntryTest]::Pick($popup,$position)
+    }
+    Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+    $frame=[Windows.Automation.AutomationElement]::FromHandle($root)
+    $condition=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::StatusBar)
+    $status=$frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$condition)
+    if (!$status) { throw 'Explorer status bar missing.' }
+    $r=$status.Current.BoundingRectangle
+    $point=[RibbonEntryTest+Point]::new($r.Left+60,$r.Top+$r.Height/2)
+    $child=Join-Path $folder 'Moved'
+    [void][IO.Directory]::CreateDirectory($child)
+    $other=$null
+    try {
+        Pick-Action $root 2
+        Wait-For 'duplicated tab' { [RibbonEntryTest]::TabCount($tabs) -eq 2 } | Out-Null
+        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Moved')
+        $item=Wait-For 'visible child folder' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$name) }
+        $hit=$item.GetClickablePoint()
+        [RibbonEntryTest]::OpenItem($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
+        Wait-For 'changed duplicate' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
+        if ([RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Opening a subfolder created another tab.' }
+        Start-Sleep -Milliseconds 550
+        $dpi=[RibbonEntryTest]::GetDpiForWindow($tabs)
+        [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
+        Wait-For 'tab closed' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        Pick-Action $tabs 4
+        Wait-For 'restored closed directory' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $child } | Out-Null
+        Pick-Action $tabs 3
+        $other=Wait-For 'independent copy' { $shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and $_.Document.Folder.Self.Path -eq $child } | Select-Object -First 1 }
+        if ([RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Opening in a new window removed the original tab.' }
+        $otherRoot=[IntPtr][long]$other.HWND
+        $otherBar=[IntPtr](Wait-For 'second window band' { [FixtureWindow]::GetProp($otherRoot,'EZFolder.Band.2').ToInt64() } )
+        $otherTabs=[RibbonEntryTest]::GetDlgItem($otherBar,102)
+        $window.Left=0; $window.Top=60; $window.Width=560
+        $other.Left=580; $other.Top=60; $other.Width=560
+        Start-Sleep -Milliseconds 500
+        $from=[RibbonEntryTest]::Bounds($tabs); $to=[RibbonEntryTest]::Bounds($otherTabs)
+        $x=$to.Left+15-$from.Left; $y=$to.Top+8-$from.Top
+        [RibbonEntryTest]::Mouse($tabs,0x201,12,8)
+        [RibbonEntryTest]::Mouse($tabs,0x200,$x,$y)
+        Wait-For 'drag feedback identifies merge target' { [RibbonEntryTest]::DragTip($bar) } | Out-Null
+        [RibbonEntryTest]::Mouse($tabs,0x202,$x,$y)
+        Start-Sleep -Milliseconds 250
+        Wait-For 'explicit drop moves only the dragged folder' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 1 -and [RibbonEntryTest]::TabCount($otherTabs) -eq 2 -and
+                $window.Document.Folder.Self.Path -eq $child -and $other.Document.Folder.Self.Path -eq $folder
+        } | Out-Null
+        'PASS: duplicate, restore, independent copy, drag preview and acknowledged cross-window move.'
+        if ($TestRouting) {
+            $competing=@($shell.Windows() | Where-Object { $_.HWND -notin @($window.HWND,$other.HWND) -and [RibbonEntryTest]::Shown([IntPtr][long]$_.HWND) })
+            if ($competing.Count) { throw 'Routing test needs two isolated Explorer frames.' }
+            function Open-RoutedFolder($name,$receiver,$strip) {
+                $path=Join-Path $folder $name
+                [void][IO.Directory]::CreateDirectory($path)
+                $count=[RibbonEntryTest]::TabCount($strip)
+                $shell.ShellExecute($path)
+                Wait-For "default folder open into $name" { [RibbonEntryTest]::TabCount($strip) -eq $count+1 -and $receiver.Document.Folder.Self.Path -eq $path } | Out-Null
+            }
+            [void][RibbonEntryTest]::SetForegroundWindow($root)
+            Open-RoutedFolder 'Primary' $other $otherTabs
+            if (![FixtureWindow]::GetProp($otherBar,'EZFolder.Primary').ToInt64()) { throw 'The larger window was not marked primary.' }
+            $other.Width=480
+            $plus=[RibbonEntryTest]::GetDlgItem($otherBar,100)
+            for ($i=0;$i -lt 64 -and ![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64();$i++) {
+                Wait-For 'enabled plus' { [RibbonEntryTest]::IsWindowEnabled($plus) } | Out-Null
+                $n=[RibbonEntryTest]::TabCount($otherTabs)
+                [RibbonEntryTest]::NewTab($otherBar)
+                Wait-For 'additional tab' { [RibbonEntryTest]::TabCount($otherTabs) -eq $n+1 } | Out-Null
+            }
+            if (![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64()) {throw 'Fixture did not reach capacity.'}
+            Open-RoutedFolder 'Overflow' $window $tabs
+            $other.Width=900
+            Wait-For 'primary has room again' { ![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64() } | Out-Null
+            Open-RoutedFolder 'BackToPrimary' $other $otherTabs
+            'PASS: native non-desktop default open, primary election, full-window overflow and return to primary.'
+        }
+    } finally {
+        if ($other) { $other.Quit() }
+        if ($TestRouting) {
+            foreach ($name in 'Primary','Overflow','BackToPrimary') {
+                $path=Join-Path $folder $name
+                if ([IO.Directory]::Exists($path)) { [IO.Directory]::Delete($path) }
+            }
+        }
+        if ([IO.Directory]::Exists($child)) { [IO.Directory]::Delete($child) }
+    }
+}
 function Test-SettingsMenu {
     Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
     function SettingControl($name) {
@@ -165,8 +294,10 @@ function Test-SettingsMenu {
         foreach ($action in @('Cancel','Customize','CancelReset','Reset')) {
             [void][RibbonEntryTest]::SetForegroundWindow($root)
             Wait-For "entry ready for right-click ($action)" { Test-Placement } | Out-Null
-            [RibbonEntryTest]::Context($button)
-            $popup = [IntPtr](Wait-For "settings context menu ($action)" { [RibbonEntryTest]::SettingsPopup($button).ToInt64() })
+            $band=[FixtureWindow]::GetProp($root,'EZFolder.Band.2')
+            $strip=[RibbonEntryTest]::GetDlgItem($band,102)
+            [RibbonEntryTest]::Context($strip)
+            $popup = [IntPtr](Wait-For "settings context menu ($action)" { [RibbonEntryTest]::SettingsPopup($strip).ToInt64() })
             [RibbonEntryTest]::Pick($popup,0)
             $popup = [IntPtr]::Zero
             $dialog = [IntPtr](Wait-For "standalone settings dialog ($action)" { [RibbonEntryTest]::SettingsDialog($button).ToInt64() })
@@ -281,6 +412,7 @@ try {
     $window.Width = $width
     Wait-For 'right edge at original width' { Test-Placement } | Out-Null
     'PASS: the button follows the ribbon edge and receives hits at both widths.'
+    if ($TestTabActions -or $TestRouting) { Test-TabActions }
     if ($TestSettings) { Test-SettingsMenu }
     if ($PreviewPath) {
         Add-Type -AssemblyName System.Drawing

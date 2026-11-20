@@ -3,6 +3,12 @@ $ErrorActionPreference = 'Stop'
 $id = '{5129B68D-A44B-427B-AEE1-53137D3989EA}'
 $legacyId = '{6751F5D7-8C60-4B05-9A79-6EB61FABED30}'
 $class = "Software\Classes\CLSID\$id"
+$handlerId = '{885E4B09-DA21-42F4-BD05-8A91FBE8FBA6}'
+$handlerClass = "Software\Classes\CLSID\$handlerId"
+$directoryShell = 'Software\Classes\Directory\shell'
+$desktopVerb = 'EZFolder.Open'
+$backupKey = 'Software\EZFolder\DirectoryVerbBackup'
+$userRegistry = [Microsoft.Win32.Registry]::CurrentUser
 $toolbar = 'Software\Microsoft\Internet Explorer\Toolbar'
 # CATID_CommBand is the horizontal Explorer band category.
 $category = '{00021494-0000-0000-C000-000000000046}'
@@ -16,6 +22,20 @@ $menu = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'EZFolder'
 $labels = @{ Enable = '开启 EZFolder'; Disable = '关闭 EZFolder' }
 try {
     if ($Uninstall) {
+        $shellKey=$userRegistry.OpenSubKey($directoryShell,$true)
+        $backup=$userRegistry.OpenSubKey($backupKey)
+        if ($shellKey) {
+            try {
+                if ($shellKey.GetValue('') -eq $desktopVerb) {
+                    if ($backup -and $backup.GetValue('HadValue') -eq 1) { $shellKey.SetValue('',$backup.GetValue('Original')) }
+                    else { $shellKey.DeleteValue('',$false) }
+                }
+                $shellKey.DeleteSubKeyTree($desktopVerb,$false)
+            } finally { $shellKey.Dispose() }
+        }
+        if ($backup) { $backup.Dispose() }
+        $userRegistry.DeleteSubKeyTree($backupKey,$false)
+        $userRegistry.DeleteSubKeyTree($handlerClass,$false)
         & (Join-Path $PSScriptRoot 'setup-entry.ps1') -Uninstall
         $key = $registry.OpenSubKey($toolbar, $true)
         if ($key) { try { $key.DeleteValue($id, $false) } finally { $key.Dispose() } }
@@ -54,6 +74,31 @@ try {
             $key.SetValue('ThreadingModel', 'Apartment')
         } finally { $key.Dispose() }
         $registry.CreateSubKey("$class\Implemented Categories\$category").Dispose()
+        $key = $userRegistry.CreateSubKey("$handlerClass\InprocServer32")
+        try { $key.SetValue('', $dll); $key.SetValue('ThreadingModel','Apartment') } finally { $key.Dispose() }
+        $effective=(Get-Item 'Registry::HKEY_CLASSES_ROOT\Directory\shell').GetValue('')
+        $native=(Get-Item 'Registry::HKEY_CLASSES_ROOT\Folder\shell\open\command').GetValue('DelegateExecute')
+        if ($native -and $effective -in @($null,'','none','open',$desktopVerb)) {
+            $shellKey=$userRegistry.CreateSubKey($directoryShell)
+            try {
+                if ($shellKey.GetValue('') -ne $desktopVerb) {
+                    $backup=$userRegistry.CreateSubKey($backupKey)
+                    try {
+                        $had=$shellKey.GetValueNames() -contains ''
+                        if ($had) { $backup.SetValue('Original',$shellKey.GetValue('')) }
+                        $backup.SetValue('HadValue',[int]$had)
+                    } finally { $backup.Dispose() }
+                }
+                $verb=$shellKey.CreateSubKey($desktopVerb)
+                try {
+                    $verb.SetValue('MUIVerb','打开')
+                    $verb.SetValue('MultiSelectModel','Player')
+                    $command=$verb.CreateSubKey('command')
+                    try { $command.SetValue('DelegateExecute',$handlerId) } finally { $command.Dispose() }
+                } finally { $verb.Dispose() }
+                $shellKey.SetValue('',$desktopVerb)
+            } finally { $shellKey.Dispose() }
+        } else { Write-Warning 'Keeping the existing custom folder command. Ordinary window merging remains available.' }
         $key = $registry.CreateSubKey($toolbar)
         try { $key.SetValue($id, 'EZFolder') } finally { $key.Dispose() }
         $controller = Join-Path $installDir 'visibility.ps1'
@@ -70,6 +115,8 @@ try {
         & (Join-Path $PSScriptRoot 'setup-entry.ps1')
         Write-Output "EZFolder registered: $dll"
     }
+    Add-Type -Name FolderAssociations -Namespace EZFolderInstall -MemberDefinition '[System.Runtime.InteropServices.DllImport("shell32")] public static extern void SHChangeNotify(int e, uint flags, System.IntPtr a, System.IntPtr b);'
+    [EZFolderInstall.FolderAssociations]::SHChangeNotify(0x08000000,0,[IntPtr]::Zero,[IntPtr]::Zero)
     $oldClass = "Software\Classes\CLSID\$legacyId"
     $oldServer = $registry.OpenSubKey("$oldClass\InprocServer32")
     if ($oldServer) {

@@ -6,9 +6,12 @@
 #include <commctrl.h>
 #include <shlobj.h>
 #include <shlguid.h>
+#include <oleacc.h>
 #include <algorithm>
 #include <memory>
 #include <new>
+#include <string>
+#include <tuple>
 #include <vector>
 
 // Shared with install.ps1. Every Explorer window creates its own Band.
@@ -28,6 +31,7 @@ struct FreePidl { void operator()(ITEMIDLIST* p) const { CoTaskMemFree(p); } };
 using Location = std::unique_ptr<ITEMIDLIST, FreePidl>;
 #include "merge_visibility.h"
 #include "window_merge.h"
+#include "desktop_open.h"
 #include "band_theme.h"
 #include "settings.h"
 
@@ -48,6 +52,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     std::vector<Location> folders;
     int active = -1, destination = -1;
     bool closeAfterSwitch = false;
+    bool rememberRemoval = false, restoring = false, copyToWindow = false, dragging = false;
+    std::vector<Location> closed;
+    std::wstring dragText;
+    HWND statusBar = nullptr, statusHost = nullptr, loadingCover = nullptr, bandParent = nullptr;
+    ULONGLONG loadingSince = 0;
     int pendingNew = -1;
     int pressedTab = -1;
     bool pressedClose = false;
@@ -63,6 +72,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static constexpr UINT refreshMessage = WM_APP + 28;
     static constexpr UINT separateMessage = WM_APP + 29;
     static constexpr UINT shortcutMessage = WM_APP + 30;
+    static constexpr UINT navigateMessage = WM_APP + 31;
+    int queuedTab = -1;
+    bool presentQueued = false;
     bool watchingKeys = false;
     Band* nextOnThread = nullptr;
     inline static thread_local HHOOK threadKeys = nullptr;
@@ -131,6 +143,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                                      SMTO_ABORTIFHUNG | SMTO_BLOCK,200,&matches) || !matches) return false;
         }
         if (!canStore(source,birth)) return false;
+        merge::markReceiver(bar);
         int index = append(std::move(id),false);
         if (index < 0) return false;
         merge::LocalOffer::confirm(source,bar,birth,folders[index].get());
@@ -152,6 +165,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         bool single = nextImported < 0 && !MergeVisibility::pending(bar,merge::frame(source));
         if (nextImported < 0) firstImportedAt = now;
         nextImported = index;
+        showLoading(index);
         activateAfter = single ? now : now+120;
         schedule(25);
         if (single && destination < 0 && (!awaitingAck || GetPropW(awaitingAck,merge::offerProp) != bar))
@@ -320,11 +334,18 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
         if (now >= nextThemeCheck) {
             theme.refresh(bar, tooltip, false);
+            if ((!statusBar && !statusHost) || !bandParent) attachMenus();
             nextThemeCheck = now + 1000;
         }
         sync();
+        if (queuedTab>=0 && destination<0 && separating<0) navigateQueued();
+        if ((destination>=0 || nextImported>=0 || queuedTab>=0) && now>=loadingSince+150 && loadingSince) {
+            theme.loading=queuedTab>=0 ? queuedTab : nextImported>=0 ? nextImported : destination;
+            InvalidateRect(tabs,nullptr,FALSE);
+        }
         checkSeparation();
         checkNewWindow();
+        if (loadingSince && queuedTab<0 && destination<0 && nextImported<0) { clearLoading(); controls(); }
         if (confirming) received(confirming, confirmingBirth, confirmingStored);
         if (nextImported >= 0 && destination < 0 && !incoming && separating < 0 && now >= activateAfter &&
             (!awaitingAck || GetPropW(awaitingAck,merge::offerProp) != bar)) {
@@ -370,9 +391,17 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     }
     void controls() {
         if (!tabs || !add) return;
-        if (TabCtrl_GetCurSel(tabs) != active) TabCtrl_SetCurSel(tabs,active);
+        int shown = loadingSince && queuedTab>=0 ? queuedTab : loadingSince && nextImported>=0 ? nextImported :
+            loadingSince && destination>=0 ? destination : active;
+        if (TabCtrl_GetCurSel(tabs) != shown) TabCtrl_SetCurSel(tabs,shown);
         EnableWindow(tabs, destination < 0 && separating < 0);
         layout();
+        bool primary=GetPropW(bar,merge::primaryProp)!=nullptr;
+        if (theme.primary!=primary) {
+            theme.primary=primary;
+            SetWindowTextW(add,primary?L"新建标签页（主窗口）":L"新建标签页");
+            InvalidateRect(add,nullptr,FALSE);
+        }
         InvalidateRect(tabs, nullptr, FALSE);
     }
     int append(Location location, bool activate = true) {
@@ -389,15 +418,113 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     void erase(int index) {
         if (index == nextImported) nextImported = -1;
         else if (index < nextImported) --nextImported;
+        if (index == queuedTab) queuedTab=-1;
+        else if (index < queuedTab) --queuedTab;
         TabCtrl_DeleteItem(tabs, index);
         folders.erase(folders.begin() + index);
         if (active > index) --active;
+    }
+    void remember(int index) {
+        Location snapshot(ILCloneFull(folders[index].get()));
+        if (!snapshot) return;
+        closed.push_back(std::move(snapshot));
+        if (closed.size()>10) closed.erase(closed.begin());
+    }
+    void clearLoading() {
+        if (loadingCover) DestroyWindow(loadingCover);
+        loadingCover=nullptr;
+        loadingSince=0;
+        theme.loading=-1;
+    }
+    void showLoading(int index) {
+        if (!loadingCover) {
+            Com<IShellView> view;
+            HWND content=nullptr;
+            if (SUCCEEDED(browser->QueryActiveShellView(&view.p)) && view.p && SUCCEEDED(view->GetWindow(&content)) && content) {
+                HWND parent=GetParent(content);
+                RECT r{};
+                GetWindowRect(content,&r);
+                MapWindowPoints(nullptr,parent,reinterpret_cast<POINT*>(&r),2);
+                loadingCover=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"",WS_CHILD|WS_CLIPSIBLINGS,
+                    r.left,r.top,r.right-r.left,r.bottom-r.top,parent,nullptr,module,nullptr);
+                if (loadingCover) {
+                    SetWindowSubclass(loadingCover,coverProc,1,reinterpret_cast<DWORD_PTR>(this));
+                    SetWindowPos(loadingCover,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW|SWP_NOACTIVATE);
+                    UpdateWindow(loadingCover);
+                }
+            }
+        }
+        loadingSince=GetTickCount64();
+        theme.loading=-1;
+        TabCtrl_SetCurSel(tabs,index);
+        RedrawWindow(tabs,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW);
+    }
+    void navigateQueued() {
+        if (queuedTab<0) return;
+        if (presentQueued) {
+            presentQueued=false;
+            HWND root=merge::frame(bar);
+            if (IsIconic(root)) ShowWindow(root,SW_RESTORE);
+            if (GetForegroundWindow()!=root) SetForegroundWindow(root);
+            showLoading(queuedTab);
+            PostMessageW(bar,navigateMessage,0,0);
+            return;
+        }
+        if (destination>=0 || separating>=0 || incoming) return;
+        int index=queuedTab;
+        queuedTab=-1;
+        select(index);
+        if (destination<0 && nextImported<0 && queuedTab<0) clearLoading();
+    }
+    bool acceptPath(HWND source,const COPYDATASTRUCT& packet) {
+        if (!merge::live(bar) || !settled || closingMergedFrame || !hasRoom() || separating>=0 ||
+            incoming || storing || active<0 || !IsWindowEnabled(merge::frame(bar))) return false;
+        bool move=packet.dwData==merge::movePath();
+        if (move && (!merge::live(source) || source==bar || GetPropW(source,merge::offerProp)!=bar)) return false;
+        if (!packet.lpData || packet.cbData<2*sizeof(wchar_t) || packet.cbData>65536 || packet.cbData%sizeof(wchar_t)) return false;
+        auto path=static_cast<const wchar_t*>(packet.lpData);
+        size_t length=packet.cbData/sizeof(wchar_t)-1;
+        if (path[length] || wmemchr(path,0,length)) return false;
+        bool disk=(length>=3 && path[1]==L':' && path[2]==L'\\') || !wcsncmp(path,L"\\\\",2);
+        if (!disk && !(move && !wcsncmp(path,L"::{",3))) return false;
+        PIDLIST_ABSOLUTE parsed=nullptr;
+        SFGAOF attrs=SFGAO_FOLDER;
+        if (FAILED(SHParseDisplayName(path,nullptr,&parsed,SFGAO_FOLDER,&attrs))) return false;
+        Location id(parsed);
+        if (!(attrs&SFGAO_FOLDER) || !bar || !hasRoom() || separating>=0 || incoming) return false;
+        if (!move) merge::markReceiver(bar);
+        int index=append(std::move(id),false);
+        if (index<0) return false;
+        queuedTab=index;
+        nextImported=-1;
+        presentQueued=true;
+        // Return ownership before activation. Changing foreground can synchronously
+        // notify the sending thread, which is still waiting for this receipt.
+        TabCtrl_SetCurSel(tabs,index);
+        PostMessageW(bar,navigateMessage,0,0);
+        schedule(25);
+        return true;
+    }
+    static LRESULT CALLBACK coverProc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
+        auto* self=reinterpret_cast<Band*>(data);
+        if (msg==WM_ERASEBKGND) { self->theme.erase(reinterpret_cast<HDC>(wp),w); return 1; }
+        if (msg==WM_PAINT) {
+            PAINTSTRUCT ps{}; HDC dc=BeginPaint(w,&ps); self->theme.erase(dc,w); EndPaint(w,&ps); return 0;
+        }
+        if (msg==WM_NCDESTROY && self->loadingCover==w) self->loadingCover=nullptr;
+        return DefSubclassProc(w,msg,wp,lp);
     }
     void completeSwitch() {
         int previous = active;
         active = destination;
         destination = -1;
-        if (closeAfterSwitch) erase(previous);
+        if (closeAfterSwitch) {
+            if (rememberRemoval) remember(previous);
+            erase(previous);
+        }
+        if (restoring && !closed.empty()) closed.pop_back();
+        restoring=rememberRemoval=false;
+        if (queuedTab<0 && nextImported<0) clearLoading();
         closeAfterSwitch = false;
         pendingNew = -1;
         endImport(true);
@@ -414,6 +541,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             if (GetTickCount64() < deadline) return;
             destination = -1;
             closeAfterSwitch = false;
+            restoring=rememberRemoval=false;
+            clearLoading();
             endImport(false);
             if (pendingNew >= 0) { erase(pendingNew); pendingNew = -1; }
             controls();
@@ -427,13 +556,14 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             label(active, false);
         }
     }
-    void select(int index, bool removePrevious = false) {
+    void select(int index, bool removePrevious = false, bool saveClosed = false) {
         nextImported = -1;
         if (destination >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
         sync();
         if (index == active || active < 0) return;
         destination = index;
         closeAfterSwitch = removePrevious;
+        rememberRemoval = saveClosed;
         deadline = GetTickCount64() + 15000;
         if (ILIsEqual(folders[active].get(), folders[index].get())) {
             if (!incoming) { completeSwitch(); return; }
@@ -449,6 +579,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (FAILED(hr) && destination >= 0) {
             destination = -1;
             closeAfterSwitch = false;
+            restoring=rememberRemoval=false;
+            clearLoading();
             endImport(false);
             if (pendingNew >= 0) { erase(pendingNew); pendingNew = -1; }
             controls();
@@ -469,13 +601,13 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         Location target(id);
         if (replaceLast && ILIsEqual(target.get(),folders[active].get())) return;
         pendingNew = append(std::move(target),false);
-        if (pendingNew >= 0) select(pendingNew,replaceLast);
+        if (pendingNew >= 0) select(pendingNew,replaceLast,replaceLast);
     }
-    void closeTab(int index) {
+    void closeTab(int index,bool saveClosed=true) {
         if (destination >= 0 || separating >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
         if (folders.size() == 1) { newTab(true); return; }
-        if (index == active) select(index > 0 ? index - 1 : 1, true);
-        else { erase(index); controls(); }
+        if (index == active) select(index > 0 ? index - 1 : 1, true,saveClosed);
+        else { if (saveClosed) remember(index); erase(index); controls(); }
     }
     void checkSeparation() {
         if (separating < 0 || !independent) return;
@@ -491,16 +623,17 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         bool original = index < static_cast<int>(folders.size()) &&
             ILIsEqual(folders[index].get(),separationFolder.get());
         separationFolder.reset();
-        if (landed && original) closeTab(index);
+        if (landed && original && !copyToWindow) closeTab(index,false);
         else if (!landed) MessageBeep(MB_ICONWARNING);
         controls();
     }
-    void separate(int index, POINT drop) {
+    void separate(int index, POINT drop,bool copy=false) {
         if (destination >= 0 || separating >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
         settle();
         nextImported = -1;
         HWND source = merge::frame(bar);
-        if (folders.size() == 1) {
+        copyToWindow=copy;
+        if (!copy && folders.size() == 1) {
             if (IsZoomed(source)) ShowWindow(source,SW_RESTORE);
             SetWindowPos(source,nullptr,drop.x-scale(65),drop.y-scale(50),0,0,SWP_NOSIZE|SWP_NOZORDER);
             return;
@@ -558,17 +691,183 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         SetForegroundWindow(root);
         schedule(25);
     }
+    enum MenuCommand { Settings=200, Duplicate, NewWindow, Restore };
+    void tabMenu(POINT point) {
+        if (!tabs || !IsWindowVisible(bar)) return;
+        sync();
+        bool keyboard=point.x==-1 && point.y==-1;
+        if (keyboard) {
+            RECT r{}; TabCtrl_GetItemRect(tabs,std::max(active,0),&r);
+            point={r.left,r.bottom}; ClientToScreen(tabs,&point);
+        }
+        POINT client=point; ScreenToClient(tabs,&client);
+        TCHITTESTINFO hit{client,0};
+        int index=keyboard ? active : TabCtrl_HitTest(tabs,&hit);
+        if (index<0) index=active;
+        bool idle=destination<0 && separating<0 && !incoming && queuedTab<0 && !storing;
+        Location clicked(index>=0 ? ILCloneFull(folders[index].get()) : nullptr);
+        HMENU menu=CreatePopupMenu();
+        if (!menu) return;
+        const wchar_t* names[]={L"设置",L"复制此标签页",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
+        bool enabled[]={true,idle && clicked && hasRoom(),idle && clicked,idle && hasRoom() && !closed.empty()};
+        MSAAMENUINFO accessible[4]{};
+        HBRUSH bg=theme.darkMenu()?CreateSolidBrush(RGB(43,43,43)):nullptr;
+        if (bg) {
+            MENUINFO info{}; info.cbSize=sizeof(info); info.fMask=MIM_BACKGROUND; info.hbrBack=bg;
+            SetMenuInfo(menu,&info);
+        }
+        for (UINT i=0;i<4;++i) {
+            if (i==1) AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+            MENUITEMINFOW entry{}; entry.cbSize=sizeof(entry); entry.wID=Settings+i;
+            entry.fMask=MIIM_ID|MIIM_FTYPE|MIIM_STRING|MIIM_STATE;
+            entry.dwTypeData=const_cast<PWSTR>(names[i]);
+            entry.fState=enabled[i]?MFS_ENABLED:MFS_DISABLED;
+            if (bg) {
+                accessible[i]={MSAA_MENU_SIG,static_cast<DWORD>(wcslen(names[i])),entry.dwTypeData};
+                entry.fType=MFT_OWNERDRAW;
+                entry.fMask|=MIIM_DATA; entry.dwItemData=reinterpret_cast<ULONG_PTR>(&accessible[i]);
+            }
+            InsertMenuItemW(menu,GetMenuItemCount(menu),TRUE,&entry);
+        }
+        UINT choice=TrackPopupMenuEx(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,bar,nullptr);
+        DestroyMenu(menu);
+        if (bg) DeleteObject(bg);
+        if (!bar) return;
+        if (choice==Settings) {
+            HWND manager=FindWindowExW(HWND_MESSAGE,nullptr,L"EZFolder.EntryManager",nullptr);
+            if (manager) PostMessageW(manager,merge::openSettings(),reinterpret_cast<WPARAM>(merge::frame(bar)),0);
+            return;
+        }
+        if (destination>=0 || separating>=0 || incoming || queuedTab>=0) return;
+        if (choice==NewWindow && index>=0 && index<static_cast<int>(folders.size()) && clicked && ILIsEqual(clicked.get(),folders[index].get())) {
+            RECT r{}; GetWindowRect(merge::frame(bar),&r);
+            separate(index,{r.left+scale(96),r.top+scale(80)},true);
+        } else if (hasRoom() && (choice==Duplicate || (choice==Restore && !closed.empty()))) {
+            Location id=choice==Duplicate ? std::move(clicked) : Location(ILCloneFull(closed.back().get()));
+            pendingNew=append(std::move(id),false);
+            if (pendingNew>=0) { restoring=choice==Restore; select(pendingNew); }
+        }
+    }
+    static LRESULT CALLBACK hostMenuProc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
+        auto* self=reinterpret_cast<Band*>(data);
+        if (msg==WM_NCDESTROY) {
+            if (self->statusBar==w) self->statusBar=nullptr;
+            if (self->statusHost==w) self->statusHost=nullptr;
+            if (self->bandParent==w) self->bandParent=nullptr;
+        }
+        if (self->bar && IsWindowVisible(self->bar) && (msg==WM_CONTEXTMENU || msg==WM_RBUTTONUP || msg==WM_RBUTTONDOWN)) {
+            POINT p{short(LOWORD(lp)),short(HIWORD(lp))};
+            if (msg!=WM_CONTEXTMENU) ClientToScreen(w,&p);
+            bool inside=w==self->statusBar;
+            if (w==self->statusHost && WindowFromPoint(p)==w) {
+                // DirectUI hosts both the folder layout and its windowless status bar.
+                Com<IShellView> view;
+                HWND content=nullptr;
+                RECT items{},host{};
+                inside=self->browser.p && SUCCEEDED(self->browser->QueryActiveShellView(&view.p)) && view.p &&
+                    SUCCEEDED(view->GetWindow(&content)) && GetWindowRect(content,&items) &&
+                    GetWindowRect(w,&host) && PtInRect(&host,p) && p.y>=items.bottom &&
+                    host.bottom-items.bottom<=self->scale(40);
+            }
+            if (w==self->bandParent) {
+                int bands=static_cast<int>(SendMessageW(w,RB_GETBANDCOUNT,0,0));
+                POINT local=p; ScreenToClient(w,&local);
+                for (int i=0;i<bands && !inside;++i) {
+                    REBARBANDINFOW info{}; info.cbSize=sizeof(info); info.fMask=RBBIM_CHILD;
+                    RECT r{};
+                    if (SendMessageW(w,RB_GETBANDINFOW,i,reinterpret_cast<LPARAM>(&info)) &&
+                        (info.hwndChild==self->bar || IsChild(info.hwndChild,self->bar)) &&
+                        SendMessageW(w,RB_GETRECT,i,reinterpret_cast<LPARAM>(&r))) inside=PtInRect(&r,local);
+                }
+            }
+            if (inside) {
+                if (msg!=WM_RBUTTONDOWN) { self->AddRef(); self->tabMenu(p); self->Release(); }
+                return 0;
+            }
+        }
+        return DefSubclassProc(w,msg,wp,lp);
+    }
+    void attachMenus() {
+        HWND status=nullptr;
+        if (!statusHost) {
+            HWND frame=merge::frame(bar);
+            HWND tab=frame ? FindWindowExW(frame,nullptr,L"ShellTabWindowClass",nullptr) : nullptr;
+            HWND layout=tab ? FindWindowExW(tab,nullptr,L"DUIViewWndClassName",nullptr) : nullptr;
+            HWND host=layout ? FindWindowExW(layout,nullptr,L"DirectUIHWND",nullptr) : nullptr;
+            if (host && GetWindowThreadProcessId(host,nullptr)==GetCurrentThreadId() &&
+                SetWindowSubclass(host,hostMenuProc,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this))) statusHost=host;
+        }
+        if (!statusBar && SUCCEEDED(browser->GetControlWindow(FCW_STATUS,&status)) && status &&
+            GetWindowThreadProcessId(status,nullptr)==GetCurrentThreadId() &&
+            SetWindowSubclass(status,hostMenuProc,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this))) statusBar=status;
+        for (HWND w=GetParent(bar); !bandParent && w; w=GetParent(w)) {
+            wchar_t name[32]{};
+            if (GetClassNameW(w,name,32) && !_wcsicmp(name,REBARCLASSNAMEW) &&
+                SetWindowSubclass(w,hostMenuProc,reinterpret_cast<UINT_PTR>(this),reinterpret_cast<DWORD_PTR>(this))) bandParent=w;
+        }
+    }
+    HWND dropBand(POINT p) const {
+        HWND root=GetAncestor(WindowFromPoint(p),GA_ROOT);
+        HWND other=static_cast<HWND>(GetPropW(root,merge::bandProp));
+        return other!=bar && merge::live(other) ? other : nullptr;
+    }
+    bool acceptsDrop(HWND other) const {
+        return GetPropW(other,merge::countProp) && GetPropW(other,merge::readyProp) &&
+            !GetPropW(other,merge::fullProp) && IsWindowEnabled(merge::frame(other));
+    }
+    void dragFeedback(POINT p) {
+        HWND other=dropBand(p);
+        RECT r{}; GetWindowRect(bar,&r);
+        const wchar_t* hint=other ? (acceptsDrop(other)?L"松开以合并到此窗口":L"此窗口无法接收标签") :
+            PtInRect(&r,p) ? L"拖出标签栏以分离" : L"松开以分离为新窗口";
+        if (!dragging || dragText!=hint) {
+            dragText=hint;
+            tipTool.lpszText=dragText.data();
+            SendMessageW(tooltip,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&tipTool));
+        }
+        SendMessageW(tooltip,TTM_TRACKPOSITION,0,MAKELPARAM(p.x+scale(16),p.y+scale(20)));
+        if (!dragging) SendMessageW(tooltip,TTM_TRACKACTIVATE,TRUE,reinterpret_cast<LPARAM>(&tipTool));
+        dragging=true;
+        SetCursor(LoadCursorW(nullptr,other && !acceptsDrop(other)?IDC_NO:IDC_SIZEALL));
+    }
+    void endDrag() {
+        if (dragging && tooltip) SendMessageW(tooltip,TTM_TRACKACTIVATE,FALSE,reinterpret_cast<LPARAM>(&tipTool));
+        dragging=false;
+    }
+    void moveTo(int index,HWND other) {
+        if (!acceptsDrop(other) || destination>=0 || separating>=0 || index<0 || index>=static_cast<int>(folders.size())) return;
+        sync();
+        PWSTR path=nullptr;
+        Location original(ILCloneFull(folders[index].get()));
+        if (!original || FAILED(SHGetNameFromIDList(original.get(),SIGDN_DESKTOPABSOLUTEPARSING,&path))) return;
+        separating=index;
+        bool ok=SetPropW(bar,merge::offerProp,other) && merge::sendPath(other,bar,merge::movePath(),path);
+        CoTaskMemFree(path);
+        RemovePropW(bar,merge::offerProp);
+        separating=-1;
+        if (!ok || index>=static_cast<int>(folders.size()) || !ILIsEqual(original.get(),folders[index].get())) return;
+        if (folders.size()==1) PostMessageW(merge::frame(bar),WM_CLOSE,0,0);
+        else closeTab(index,false);
+    }
     bool tabMouse(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE || (msg == WM_KEYDOWN && wp == VK_ESCAPE)) {
             if (pressedTab < 0) return false;
             pressedTab = -1;
+            endDrag();
             if (GetCapture() == w) ReleaseCapture();
             return msg == WM_KEYDOWN;
         }
-        if (msg != WM_LBUTTONDOWN && msg != WM_LBUTTONUP) return false;
+        if (msg != WM_LBUTTONDOWN && msg != WM_LBUTTONUP && msg!=WM_MOUSEMOVE) return false;
         TCHITTESTINFO hit{};
         hit.pt = {static_cast<short>(LOWORD(lp)),static_cast<short>(HIWORD(lp))};
         int index = TabCtrl_HitTest(w,&hit);
+        if (msg==WM_MOUSEMOVE) {
+            if (pressedTab<0 || pressedClose) return false;
+            if (dragging || abs(hit.pt.x-pressPoint.x)>=GetSystemMetrics(SM_CXDRAG) || abs(hit.pt.y-pressPoint.y)>=GetSystemMetrics(SM_CYDRAG)) {
+                POINT screen=hit.pt; ClientToScreen(w,&screen); dragFeedback(screen);
+            }
+            return true;
+        }
         RECT item{};
         bool onClose = false;
         if (index >= 0 && TabCtrl_GetItemRect(w,index,&item)) {
@@ -587,6 +886,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         int pressed = pressedTab;
         if (pressed < 0) return false;
         pressedTab = -1;
+        endDrag();
         ReleaseCapture();
         POINT screen = hit.pt;
         ClientToScreen(w,&screen);
@@ -597,7 +897,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         } else if (!PtInRect(&strip,screen) &&
             (abs(hit.pt.x-pressPoint.x) >= GetSystemMetrics(SM_CXDRAG) ||
              abs(hit.pt.y-pressPoint.y) >= GetSystemMetrics(SM_CYDRAG))) {
-            separate(pressed,screen);
+            if (HWND other=dropBand(screen)) moveTo(pressed,other);
+            else separate(pressed,screen);
         } else if (index == pressed && !onClose) select(index);
         return true;
     }
@@ -667,6 +968,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         int button = scale(32);
         int available = std::max(0,static_cast<int>(r.right)-button);
         int count = std::max(1,static_cast<int>(folders.size()));
+        if (merge::number(bar,merge::countProp)!=folders.size()) {
+            SetPropW(bar,merge::countSinceProp,reinterpret_cast<HANDLE>(GetTickCount64()+1));
+            SetPropW(bar,merge::countProp,reinterpret_cast<HANDLE>(folders.size()));
+        }
         hideTitle();
         bool room = static_cast<int>(folders.size()) < capacity(r.right);
         if (room) RemovePropW(bar,merge::fullProp);
@@ -735,6 +1040,13 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static LRESULT CALLBACK childProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
         try {
+            if (msg==WM_RBUTTONDOWN) return 0;
+            if (msg==WM_CONTEXTMENU || msg==WM_RBUTTONUP) {
+                POINT p{short(LOWORD(lp)),short(HIWORD(lp))};
+                if (msg==WM_RBUTTONUP) ClientToScreen(w,&p);
+                Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                self->tabMenu(p); return 0;
+            }
             if (msg == WM_ERASEBKGND) return 1;
             if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
                 PAINTSTRUCT ps{};
@@ -768,11 +1080,37 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static LRESULT CALLBACK barProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
         try {
+            if (msg==WM_MEASUREITEM && lp) {
+                auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+                if (item->CtlType==ODT_MENU) { item->itemWidth=self->scale(188); item->itemHeight=self->scale(26); return TRUE; }
+            }
+            if (msg==WM_DRAWITEM && lp) {
+                auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+                if (item->CtlType==ODT_MENU) { self->theme.menuItem(*item,self->scale(96)); return TRUE; }
+            }
+            if (msg==WM_RBUTTONDOWN) return 0;
+            if (msg==WM_CONTEXTMENU || msg==WM_RBUTTONUP) {
+                POINT p{short(LOWORD(lp)),short(HIWORD(lp))};
+                if (msg==WM_RBUTTONUP) ClientToScreen(w,&p);
+                Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                self->tabMenu(p); return 0;
+            }
+            if (msg==navigateMessage) {
+                Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                self->navigateQueued(); return 0;
+            }
             if (msg==shortcutMessage) {
                 if (IsWindowVisible(w) && merge::frame(w)==GetForegroundWindow()) self->runShortcut(static_cast<int>(wp));
                 return 0;
             }
-            if (msg == WM_COPYDATA && lp) return self->matchesOffer(reinterpret_cast<HWND>(wp),*reinterpret_cast<COPYDATASTRUCT*>(lp));
+            if (msg == WM_COPYDATA && lp) {
+                auto& packet=*reinterpret_cast<COPYDATASTRUCT*>(lp);
+                if (packet.dwData==merge::openPath() || packet.dwData==merge::movePath()) {
+                    Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                    return self->acceptPath(reinterpret_cast<HWND>(wp),packet);
+                }
+                return self->matchesOffer(reinterpret_cast<HWND>(wp),packet);
+            }
             if (msg == merge::storeTab() || msg == merge::storedTab()) {
                 Com<IDeskBand> guard;
                 self->AddRef();
@@ -909,6 +1247,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         tipTool.lpszText = const_cast<wchar_t*>(L"");
         if (!SendMessageW(tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tipTool))) return E_FAIL;
         theme.refresh(bar, tooltip, true);
+        attachMenus();
         controls();
         sync();
         if (!settled && active >= 0) offeredFolder.reset(ILCloneFull(folders[active].get()));
@@ -916,6 +1255,13 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return schedule(settled ? 500 : 25) ? S_OK : E_FAIL;
     }
     void detach() {
+        for (HWND w : {statusBar,statusHost,bandParent}) if (w) RemoveWindowSubclass(w,hostMenuProc,reinterpret_cast<UINT_PTR>(this));
+        statusBar=statusHost=bandParent=nullptr;
+        endDrag();
+        clearLoading();
+        closed.clear();
+        restoring=rememberRemoval=false;
+        queuedTab=-1;
         if (watchingKeys) {
             watchingKeys=false;
             auto** link=&threadBands;
@@ -1016,8 +1362,9 @@ public:
 
 class Factory final : public IClassFactory {
     LONG refs = 1;
+    bool desktop;
 public:
-    Factory() { InterlockedIncrement(&objects); }
+    explicit Factory(bool forDesktop) : desktop(forDesktop) { InterlockedIncrement(&objects); }
     ~Factory() { InterlockedDecrement(&objects); }
     STDMETHODIMP QueryInterface(REFIID id, void** out) override {
         if (!out) return E_POINTER;
@@ -1033,7 +1380,8 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
-        auto* obj = new(std::nothrow) Band;
+        IUnknown* obj = desktop ? static_cast<IExecuteCommand*>(new(std::nothrow) DesktopOpen) :
+            static_cast<IUnknown*>(static_cast<IDeskBand*>(new(std::nothrow) Band));
         if (!obj) return E_OUTOFMEMORY;
         HRESULT hr = obj->QueryInterface(id, out);
         obj->Release();
@@ -1048,8 +1396,8 @@ public:
 extern "C" __declspec(dllexport) HRESULT WINAPI DllGetClassObject(REFCLSID id, REFIID iid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (id != clsid) return CLASS_E_CLASSNOTAVAILABLE;
-    auto* factory = new(std::nothrow) Factory;
+    if (id != clsid && id!=desktopOpenId) return CLASS_E_CLASSNOTAVAILABLE;
+    auto* factory = new(std::nothrow) Factory(id==desktopOpenId);
     if (!factory) return E_OUTOFMEMORY;
     HRESULT hr = factory->QueryInterface(iid, out);
     factory->Release();

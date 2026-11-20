@@ -18,7 +18,7 @@ constexpr wchar_t tipText[] = L"EZfolder";
 constexpr UINT toggleMessage = WM_APP + 1;
 HINSTANCE instance;
 HWND manager;
-constexpr UINT settingsCommand = 200;
+
 HANDLE settingsProcess;
 HWND pendingSettingsOwner;
 bool dark, highContrast;
@@ -183,74 +183,9 @@ void openSettings(HWND owner) {
     settingsProcess=child.hProcess;
     CloseHandle(child.hThread);
 }
-void drawMenuCommand(const DRAWITEMSTRUCT& d,UINT dpi) {
-    bool selected=(d.itemState & ODS_SELECTED)!=0;
-    int saved=SaveDC(d.hDC);
-    auto px=[dpi](int n){ return MulDiv(n,dpi,96); };
-    SetDCBrushColor(d.hDC,selected ? RGB(65,65,65) : RGB(43,43,43));
-    auto brush=static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
-    FillRect(d.hDC,&d.rcItem,brush);
-    RECT gutter=d.rcItem;
-    gutter.left+=px(23);
-    gutter.right=gutter.left+1;
-    SetDCBrushColor(d.hDC,RGB(70,70,70));
-    FillRect(d.hDC,&gutter,brush);
-    RECT label=d.rcItem;
-    label.left=gutter.right+px(8);
-    SetTextColor(d.hDC,RGB(246,246,246));
-    SetBkMode(d.hDC,TRANSPARENT);
-    DrawTextW(d.hDC,L"设置",-1,&label,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-    RestoreDC(d.hDC,saved);
-}
 LRESULT CALLBACK buttonProc(HWND w, UINT m, WPARAM a, LPARAM b, UINT_PTR, DWORD_PTR data) {
     Entry& e = *reinterpret_cast<Entry*>(data);
-    if (m==WM_MEASUREITEM) {
-        auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(b);
-        if (item->CtlType==ODT_MENU) {
-            item->itemWidth=MulDiv(150,dpiOf(w),96);
-            item->itemHeight=MulDiv(24,dpiOf(w),96);
-            return TRUE;
-        }
-    }
-    if (m==WM_DRAWITEM) {
-        auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(b);
-        if (item->CtlType==ODT_MENU) { drawMenuCommand(*item,dpiOf(w)); return TRUE; }
-    }
-    if (m == WM_CONTEXTMENU) {
-        POINT pt{static_cast<short>(LOWORD(b)),static_cast<short>(HIWORD(b))};
-        if (pt.x == -1 && pt.y == -1) {
-            RECT r{};
-            GetWindowRect(w,&r);
-            pt = {r.left,r.bottom};
-        }
-        HMENU menu=CreatePopupMenu();
-        if (!menu) return 0;
-        HBRUSH bg=dark && !highContrast ? CreateSolidBrush(RGB(43,43,43)) : nullptr;
-        MENUITEMINFOW item{};
-        item.cbSize=sizeof(item);
-        item.fMask=MIIM_ID|MIIM_STRING|MIIM_FTYPE;
-        item.wID=settingsCommand;
-        item.dwTypeData=const_cast<wchar_t*>(L"设置");
-        MSAAMENUINFO accessible{MSAA_MENU_SIG,2,item.dwTypeData};
-        if (bg) {
-            MENUINFO info{};
-            info.cbSize=sizeof(info);
-            info.fMask=MIM_BACKGROUND;
-            info.hbrBack=bg;
-            SetMenuInfo(menu,&info);
-            item.fType=MFT_OWNERDRAW;
-            item.fMask|=MIIM_DATA;
-            item.dwItemData=reinterpret_cast<ULONG_PTR>(&accessible);
-        }
-        UINT choice=0;
-        HWND owner=GetAncestor(w,GA_ROOT);
-        if (InsertMenuItemW(menu,0,TRUE,&item))
-            choice=TrackPopupMenuEx(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,w,nullptr);
-        DestroyMenu(menu);
-        if (bg) DeleteObject(bg);
-        if (choice==settingsCommand && IsWindow(owner)) openSettings(owner);
-        return 0;
-    }
+    if (m==WM_CONTEXTMENU || m==WM_RBUTTONUP || m==WM_RBUTTONDOWN) return 0;
     if (m == WM_MOUSEMOVE && !e.hot) {
         e.hot = true;
         TRACKMOUSEEVENT ev{sizeof(ev),TME_LEAVE,w,0}; TrackMouseEvent(&ev);
@@ -365,6 +300,12 @@ LRESULT CALLBACK managerProc(HWND w,UINT m,WPARAM a,LPARAM b) {
         refresh();
         if (pendingSettingsOwner && IsWindow(pendingSettingsOwner)) openSettings(pendingSettingsOwner);
         else pendingSettingsOwner=nullptr;
+        return 0;
+    }
+    static const UINT settingsRequest=RegisterWindowMessageW(L"EZFolder.Settings.4");
+    if (m==settingsRequest) {
+        HWND root=reinterpret_cast<HWND>(a);
+        if ((isClass(root,L"CabinetWClass") || isClass(root,L"ExploreWClass")) && bandVisible(root)) openSettings(root);
         return 0;
     }
     if (m==toggleMessage) {

@@ -6,7 +6,7 @@ try {
         throw 'Use the 64-bit MinGW-w64 compiler.'
     }
     New-Item -ItemType Directory -Force -Path build | Out-Null
-    & $compiler -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -static -shared -s src/deskband.cpp -o build/EZFolder.dll -lcomctl32 -luxtheme -ldwmapi -lshell32 -lole32 -loleaut32 -luuid -lgdi32 -luser32 -ladvapi32
+    & $compiler -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -static -shared -s src/deskband.cpp -o build/EZFolder.dll -lcomctl32 -luxtheme -ldwmapi -lshlwapi -lshell32 -lole32 -loleaut32 -luuid -lgdi32 -luser32 -ladvapi32
     if ($LASTEXITCODE) { throw "Build failed ($LASTEXITCODE)." }
     $framework = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319'
     $metadata = Join-Path $env:SystemRoot 'System32\WinMetadata'

@@ -37,6 +37,12 @@ class BandTheme {
             COLORREF ink = IsWindowEnabled(w) ? text : edge;
             line(dc,x-arm,y,x+arm+1,y,ink);
             line(dc,x,y-arm,x,y+arm+1,ink);
+            if (primary) {
+                int left=bounds.right-px(9),top=px(4);
+                line(dc,left,top,left+px(4),top,ink);
+                line(dc,left+px(1),top+px(1),left+px(1),top+px(6),ink);
+                line(dc,left,top+px(3),left+px(4),top+px(3),ink);
+            }
             if (focus) DrawFocusRect(dc,&r);
             return;
         }
@@ -59,6 +65,19 @@ class BandTheme {
             TabCtrl_GetItem(tabs,i,&item);
             RECT close = closeRect(r,dpi,hot);
             RECT label = labelRect(r,dpi,hot);
+            if (i==loading && label.right-label.left>=px(16)) {
+                BOOL animate=TRUE;
+                SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
+                int x=label.left+px(5), y=(r.top+r.bottom)/2;
+                static const POINT dots[]={{0,-4},{3,-3},{4,0},{3,3},{0,4},{-3,3},{-4,0},{-3,-3}};
+                int phase=animate ? static_cast<int>((GetTickCount64()/90)%8) : 0;
+                for (int j=0;j<8;++j) {
+                    int dx=x+px(dots[j].x),dy=y+px(dots[j].y);
+                    RECT dot{dx,dy,dx+px(2),dy+px(2)};
+                    fill(dc,dot,((j-phase+8)%8)<3 ? ink : edge);
+                }
+                label.left+=px(15);
+            }
             SetTextColor(dc,ink);
             UINT flags = DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX;
             if (label.right-label.left >= px(30)) flags |= DT_END_ELLIPSIS;
@@ -72,6 +91,23 @@ class BandTheme {
         }
     }
 public:
+    int loading=-1;
+    bool primary=false;
+    bool darkMenu() const { return background==RGB(0,0,0) && surface==RGB(48,48,48); }
+    void menuItem(const DRAWITEMSTRUCT& item,int dpi) const {
+        auto* data=reinterpret_cast<const MSAAMENUINFO*>(item.itemData);
+        if (!data) return;
+        int saved=SaveDC(item.hDC);
+        RECT r=item.rcItem;
+        fill(item.hDC,r,item.itemState&ODS_SELECTED ? RGB(65,65,65) : RGB(43,43,43));
+        r.left+=MulDiv(23,dpi,96);
+        line(item.hDC,r.left,r.top,r.left,r.bottom,edge);
+        r.left+=MulDiv(8,dpi,96);
+        SetTextColor(item.hDC,item.itemState&ODS_DISABLED ? GetSysColor(COLOR_GRAYTEXT) : text);
+        SetBkMode(item.hDC,TRANSPARENT);
+        DrawTextW(item.hDC,data->pszWText,-1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        RestoreDC(item.hDC,saved);
+    }
     static RECT closeRect(RECT r, int dpi, bool hot) {
         int width = MulDiv(r.right-r.left,96,dpi);
         int button = width >= 80 ? 23 : width >= 48 ? 18 : (hot && width >= 24 ? 11 : 0);
