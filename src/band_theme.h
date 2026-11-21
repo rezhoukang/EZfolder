@@ -4,8 +4,12 @@
 // Preserve the native tab control's focus, scrolling and accessibility.
 class BandTheme {
     COLORREF background{}, surface{}, hover{}, edge{}, text{}, selectedText{};
+    COLORREF closeHover{};
+    bool highContrast=false;
     HWND hotWindow = nullptr;
     int hotTab = -1;
+    POINT hotPoint{};
+    int paintDpi = 96;
     static void fill(HDC dc, const RECT& r, COLORREF color) {
         SetDCBrushColor(dc, color);
         FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
@@ -22,9 +26,9 @@ class BandTheme {
         MoveToEx(dc,x,y,nullptr);
         LineTo(dc,x2,y2);
     }
-    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, int dpi) const {
+    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, RECT dirty, int dpi) const {
         auto px = [dpi](int n) { return MulDiv(n,dpi,96); };
-        fill(dc,bounds,background);
+        fill(dc,dirty,background);
         SetBkMode(dc,TRANSPARENT);
         HFONT font = reinterpret_cast<HFONT>(SendMessageW(w,WM_GETFONT,0,0));
         if (font) SelectObject(dc,font);
@@ -45,12 +49,20 @@ class BandTheme {
             return;
         }
         int selected = TabCtrl_GetCurSel(tabs), count = TabCtrl_GetItemCount(tabs);
-        for (int i=0; i<count; ++i) {
+        int first=0, end=count;
+        RECT hotItem{};
+        if (hotWindow==tabs && hotTab>=0 && TabCtrl_GetItemRect(tabs,hotTab,&hotItem) &&
+            dirty.left>=hotItem.left && dirty.right<=hotItem.right) {
+            first=hotTab;
+            end=hotTab+1;
+        }
+        for (int i=first; i<end; ++i) {
             RECT r{};
-            if (!TabCtrl_GetItemRect(tabs,i,&r) || r.right <= 0 || r.left >= bounds.right) continue;
+            if (!TabCtrl_GetItemRect(tabs,i,&r) || r.right <= dirty.left || r.left >= dirty.right) continue;
+            bool active = i == selected, hot = w == hotWindow && i == hotTab;
+            RECT close = closeRect(r,dpi,hot);
             r.top = px(2);
             r.bottom = bounds.bottom - px(1);
-            bool active = i == selected, hot = w == hotWindow && i == hotTab;
             COLORREF ink = active ? selectedText : text;
             if (active || hot) rounded(dc,r,active ? surface : hover,px(10));
             if (!active && i+1 < count && i+1 != selected)
@@ -61,7 +73,6 @@ class BandTheme {
             item.pszText = title;
             item.cchTextMax = ARRAYSIZE(title);
             TabCtrl_GetItem(tabs,i,&item);
-            RECT close = closeRect(r,dpi,hot);
             RECT label = labelRect(r,dpi,hot);
             if (i==loading && label.right-label.left>=px(16)) {
                 BOOL animate=TRUE;
@@ -82,6 +93,14 @@ class BandTheme {
             DrawTextW(dc,title,-1,&label,flags);
             if (!IsRectEmpty(&close)) {
                 int x = (close.left+close.right)/2, y = (r.top+r.bottom)/2, arm = px(3);
+                if (hot && PtInRect(&close,hotPoint)) {
+                    int radius=std::min({px(8),int(close.right-close.left-2)/2,int(r.bottom-r.top-2)/2});
+                    if (radius>0) {
+                        RECT tile{x-radius,y-radius,x+radius+2,y+radius+2};
+                        rounded(dc,tile,highContrast ? ink : closeHover,px(5));
+                        if (highContrast) ink=active ? surface : hover;
+                    }
+                }
                 line(dc,x-arm,y-arm,x+arm+1,y+arm+1,ink);
                 line(dc,x-arm,y+arm,x+arm+1,y-arm-1,ink);
             }
@@ -131,6 +150,8 @@ public:
         if (!force && bg == background && nextSurface == surface) return;
         background = bg;
         surface = nextSurface;
+        highContrast=contrast;
+        closeHover=dark ? RGB(72,72,72) : RGB(202,202,202);
         text = dark ? RGB(242,242,242) : GetSysColor(COLOR_WINDOWTEXT);
         selectedText = contrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : text;
         hover = contrast ? bg : dark ? RGB(31,31,31) : RGB(241,241,241);
@@ -143,39 +164,65 @@ public:
         RedrawWindow(bar,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
     }
     void pointer(HWND w, HWND tabs, UINT msg, LPARAM lp) {
+        if (msg==WM_MOUSELEAVE && w!=hotWindow) return;
         HWND next = msg == WM_MOUSELEAVE ? nullptr : w;
         int index = -1;
+        POINT point{short(LOWORD(lp)),short(HIWORD(lp))};
         if (next == tabs) {
             TCHITTESTINFO hit{};
-            hit.pt = {static_cast<short>(LOWORD(lp)),static_cast<short>(HIWORD(lp))};
+            hit.pt = point;
             index = TabCtrl_HitTest(tabs,&hit);
         }
-        if (next == hotWindow && index == hotTab) return;
+        if (next == hotWindow && index == hotTab) {
+            RECT item{};
+            if (index>=0 && TabCtrl_GetItemRect(tabs,index,&item)) {
+                RECT close=closeRect(item,paintDpi,true);
+                if (PtInRect(&close,hotPoint)!=PtInRect(&close,point)) InvalidateRect(tabs,&close,FALSE);
+            }
+            hotPoint=point;
+            return;
+        }
         if (next && next != hotWindow) {
             TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,next,0};
             TrackMouseEvent(&event);
         }
-        HWND old = hotWindow;
+        auto invalidateHover=[tabs](HWND control,int tab) {
+            if (!control) return;
+            if (control!=tabs) { InvalidateRect(control,nullptr,FALSE); return; }
+            RECT item{},strip{};
+            if (tab>=0 && TabCtrl_GetItemRect(tabs,tab,&item)) {
+                GetClientRect(tabs,&strip);
+                item.top=strip.top;
+                item.bottom=strip.bottom;
+                InvalidateRect(tabs,&item,FALSE);
+            }
+        };
+        invalidateHover(hotWindow,hotTab);
         hotWindow = next;
         hotTab = index;
-        if (old) InvalidateRect(old,nullptr,FALSE);
-        if (next) InvalidateRect(next,nullptr,FALSE);
+        hotPoint=point;
+        invalidateHover(next,index);
     }
-    void paint(HWND w, HWND tabs, HDC target, int dpi) const {
+    void paint(HWND w, HWND tabs, HDC target, int dpi, const RECT* update=nullptr) {
+        paintDpi=dpi;
         RECT r{};
         GetClientRect(w,&r);
-        if (IsRectEmpty(&r)) return;
+        RECT dirty=update ? *update : r;
+        int width=dirty.right-dirty.left, height=dirty.bottom-dirty.top;
+        if (width<=0 || height<=0) return;
         HDC buffer = CreateCompatibleDC(target);
-        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target,r.right,r.bottom) : nullptr;
+        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target,width,height) : nullptr;
         if (bitmap) {
             HGDIOBJ old = SelectObject(buffer,bitmap);
-            draw(w,tabs,buffer,r,dpi);
-            BitBlt(target,0,0,r.right,r.bottom,buffer,0,0,SRCCOPY);
+            SetViewportOrgEx(buffer,-dirty.left,-dirty.top,nullptr);
+            draw(w,tabs,buffer,r,dirty,dpi);
+            SetViewportOrgEx(buffer,0,0,nullptr);
+            BitBlt(target,dirty.left,dirty.top,width,height,buffer,0,0,SRCCOPY);
             SelectObject(buffer,old);
             DeleteObject(bitmap);
         } else {
             int saved = SaveDC(target);
-            draw(w,tabs,target,r,dpi);
+            draw(w,tabs,target,r,dirty,dpi);
             RestoreDC(target,saved);
         }
         if (buffer) DeleteDC(buffer);

@@ -1053,7 +1053,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
                 PAINTSTRUCT ps{};
                 HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : reinterpret_cast<HDC>(wp);
-                if (dc) self->theme.paint(w, self->tabs, dc, self->scale(96));
+                if (dc) self->theme.paint(w, self->tabs, dc, self->scale(96), msg==WM_PAINT ? &ps.rcPaint : nullptr);
                 if (msg == WM_PAINT) EndPaint(w, &ps);
                 return 0;
             }
