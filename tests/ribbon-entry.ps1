@@ -1,4 +1,4 @@
-﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation)
+﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation,[switch]$TestQuickDrop)
 $ErrorActionPreference = 'Stop'
 Add-Type @'
 using System;
@@ -201,6 +201,35 @@ function Test-Placement {
     return ([math]::Abs($dock.Right-$r.Right-$margin) -le 1 -and $r.Top -eq $dock.Top -and
         [RibbonEntryTest]::WindowFromPoint($point) -eq $button)
 }
+function Test-SingleQuickDrop {
+    $shell=New-Object -ComObject Shell.Application
+    $bar=[FixtureWindow]::GetProp($root,'EZFolder.Band.2')
+    $tabs=[RibbonEntryTest]::GetDlgItem($bar,102)
+    $window.Left=0; $window.Top=60; $window.Width=560
+    $quick='::{679f85cb-0220-4080-b29b-5540cc05aab6}'
+    $single=New-TestExplorer $folder -Separate
+    $sourceHandle=$single.HWND
+    try {
+        $single.Left=580; $single.Top=60; $single.Width=560
+        $single.Navigate2("shell:$quick")
+        $singleBar=[IntPtr](Wait-For 'standalone Quick Access band' { [FixtureWindow]::GetProp([IntPtr][long]$sourceHandle,'EZFolder.Band.2').ToInt64() })
+        $singleTabs=[RibbonEntryTest]::GetDlgItem($singleBar,102)
+        Wait-For 'one actual Quick Access tab' { [RibbonEntryTest]::TabCount($singleTabs) -eq 1 -and $single.Document.Folder.Self.Path -eq $quick } | Out-Null
+        $before=[RibbonEntryTest]::TabCount($tabs)
+        $from=[RibbonEntryTest]::Bounds($singleTabs); $to=[RibbonEntryTest]::Bounds($tabs)
+        $x=$to.Left+15-$from.Left; $y=$to.Top+8-$from.Top
+        [RibbonEntryTest]::Mouse($singleTabs,0x201,12,8)
+        [RibbonEntryTest]::Mouse($singleTabs,0x200,$x,$y)
+        [RibbonEntryTest]::Mouse($singleTabs,0x202,$x,$y)
+        Wait-For 'last Quick Access tab transferred and source closed' {
+            [RibbonEntryTest]::TabCount($tabs) -eq $before+1 -and [RibbonEntryTest]::SelectedTab($tabs) -eq $before -and
+                $window.Document.Folder.Self.Path -eq $quick -and !@($shell.Windows() | Where-Object { $_.HWND -eq $sourceHandle }).Count
+        } | Out-Null
+        'PASS: moved the last Quick Access tab to another window.'
+    } finally {
+        if (@($shell.Windows() | Where-Object { $_.HWND -eq $sourceHandle }).Count) { $single.Quit() }
+    }
+}
 function Test-TabActions {
     $shell=New-Object -ComObject Shell.Application
     $bar=[FixtureWindow]::GetProp($root,'EZFolder.Band.2')
@@ -362,6 +391,7 @@ function Test-TabActions {
             Open-RoutedFolder 'BackToPrimary' $other $otherTabs
             'PASS: external default open, primary election, Explore overflow and return to primary.'
         }
+        Test-SingleQuickDrop
     } finally {
         if ($other) { $other.Quit() }
         if ($TestRouting) {
@@ -561,12 +591,12 @@ try {
     $entry = [IntPtr](Wait-For 'ribbon entry' { [RibbonEntryTest]::Entry($root).ToInt64() })
     $button = [RibbonEntryTest]::GetDlgItem($entry,1)
     $initiallyShown = [RibbonEntryTest]::Shown($root)
-    if ($TestNavigation) {
+    if ($TestNavigation -or $TestQuickDrop) {
         if (!$initiallyShown) {
             [RibbonEntryTest]::Click($button)
             Wait-For 'navigation fixture band' { [RibbonEntryTest]::Shown($root) } | Out-Null
         }
-        Test-TabActions
+        if ($TestQuickDrop) { Test-SingleQuickDrop } else { Test-TabActions }
         return
     }
     if ($initiallyShown) { [RibbonEntryTest]::Click($button); Wait-For 'initial hide' { ![RibbonEntryTest]::Shown($root) } | Out-Null }

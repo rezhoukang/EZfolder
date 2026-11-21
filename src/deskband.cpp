@@ -545,6 +545,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         bool disk=(length>=3 && path[1]==L':' && path[2]==L'\\') || !wcsncmp(path,L"\\\\",2);
         bool query=packet.dwData==merge::containsPath();
         if (!disk && !((move || query) && !wcsncmp(path,L"::{",3))) return false;
+        // Some virtual folders (notably Quick Access) round-trip their desktop
+        // parsing name only when it is qualified with the shell: prefix.
+        std::wstring shellName;
+        if (!disk) { shellName=L"shell:"; shellName+=path; path=shellName.c_str(); }
         PIDLIST_ABSOLUTE parsed=nullptr;
         SFGAOF attrs=SFGAO_FOLDER;
         if (FAILED(SHParseDisplayName(path,nullptr,&parsed,SFGAO_FOLDER,&attrs))) return false;
