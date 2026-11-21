@@ -249,12 +249,12 @@ function Test-TabActions {
         if ($TestRouting) {
             $competing=@($shell.Windows() | Where-Object { $_.HWND -notin @($window.HWND,$other.HWND) -and [RibbonEntryTest]::Shown([IntPtr][long]$_.HWND) })
             if ($competing.Count) { throw 'Routing test needs two isolated Explorer frames.' }
-            function Open-RoutedFolder($name,$receiver,$strip) {
+            function Open-RoutedFolder($name,$receiver,$strip,[switch]$Explore) {
                 $path=Join-Path $folder $name
                 [void][IO.Directory]::CreateDirectory($path)
                 $count=[RibbonEntryTest]::TabCount($strip)
-                $shell.ShellExecute($path)
-                Wait-For "default folder open into $name" { [RibbonEntryTest]::TabCount($strip) -eq $count+1 -and $receiver.Document.Folder.Self.Path -eq $path } | Out-Null
+                if ($Explore) { $shell.Explore($path) } else { $shell.ShellExecute($path) }
+                Wait-For "folder open into $name" { [RibbonEntryTest]::TabCount($strip) -eq $count+1 -and $receiver.Document.Folder.Self.Path -eq $path } | Out-Null
             }
             [void][RibbonEntryTest]::SetForegroundWindow($root)
             Open-RoutedFolder 'Primary' $other $otherTabs
@@ -268,11 +268,11 @@ function Test-TabActions {
                 Wait-For 'additional tab' { [RibbonEntryTest]::TabCount($otherTabs) -eq $n+1 } | Out-Null
             }
             if (![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64()) {throw 'Fixture did not reach capacity.'}
-            Open-RoutedFolder 'Overflow' $window $tabs
+            Open-RoutedFolder 'Overflow' $window $tabs -Explore
             $other.Width=900
             Wait-For 'primary has room again' { ![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64() } | Out-Null
             Open-RoutedFolder 'BackToPrimary' $other $otherTabs
-            'PASS: native non-desktop default open, primary election, full-window overflow and return to primary.'
+            'PASS: external default open, primary election, Explore overflow and return to primary.'
         }
     } finally {
         if ($other) { $other.Quit() }
@@ -416,6 +416,26 @@ function Test-Tooltip {
         Wait-For 'visible tooltip containing exactly EZfolder' { [RibbonEntryTest]::Tip($button).ToInt64() } | Out-Null
     } finally { [void][RibbonEntryTest]::SetCursorPos($saved.X,$saved.Y) }
 }
+function Test-OpenWithoutReceiver {
+    $shell=New-Object -ComObject Shell.Application
+    foreach ($action in 'default','explore') {
+        if (@($shell.Windows() | Where-Object { [RibbonEntryTest]::Shown([IntPtr][long]$_.HWND) }).Count) {
+            throw 'Fallback test needs all receiving bands hidden.'
+        }
+        $path=Join-Path $folder "Fallback-$action"
+        [void][IO.Directory]::CreateDirectory($path)
+        try {
+            if ($action -eq 'explore') { $shell.Explore($path) } else { $shell.ShellExecute($path) }
+            $child=Wait-For "native $action without a receiver" {
+                $shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and $_.Document.Folder.Self.Path -eq $path } | Select-Object -First 1
+            }
+            $handle=$child.HWND
+            $child.Quit()
+            Wait-For 'fallback window closed' { !@($shell.Windows() | Where-Object { $_.HWND -eq $handle }).Count } | Out-Null
+        } finally { [IO.Directory]::Delete($path) }
+    }
+    'PASS: default open and explicit Explore opened a native window with the receiving band hidden.'
+}
 $folder = Join-Path $env:TEMP ('EZFolder-button-'+[guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($folder)
 . (Join-Path $PSScriptRoot 'fixture-window.ps1')
@@ -431,6 +451,7 @@ try {
     $initiallyShown = [RibbonEntryTest]::Shown($root)
     if ($initiallyShown) { [RibbonEntryTest]::Click($button); Wait-For 'initial hide' { ![RibbonEntryTest]::Shown($root) } | Out-Null }
     Wait-For 'click target in the ribbon while tabs are hidden' { Test-Placement } | Out-Null
+    if ($TestRouting) { Test-OpenWithoutReceiver }
     if ($TestHover) { Test-Tooltip }
     foreach ($wanted in @($true,$false,$true)) {
         [RibbonEntryTest]::Click($button)

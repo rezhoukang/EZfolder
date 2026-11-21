@@ -1,11 +1,13 @@
 #pragma once
 #include <shlwapi.h>
 
-// Called by the Directory default verb. Pass the original Shell command its
-// original site, selection and options so in-window navigation stays native.
+// A Directory verb can forward to its original Folder verb without re-entering
+// our handler. Keep the site and selection so in-window navigation stays native.
 static constexpr CLSID desktopOpenId={0x885e4b09,0xda21,0x42f4,{0xbd,0x05,0x8a,0x91,0xfb,0xe8,0xfb,0xa6}};
-class DesktopOpen final : public IExecuteCommand, public IObjectWithSelection, public IObjectWithSite {
+static constexpr CLSID exploreFolderId={0x0e630a37,0xa7ef,0x4ac7,{0xa7,0x62,0x9d,0x50,0x1a,0x3d,0x4d,0x05}};
+class FolderOpen final : public IExecuteCommand, public IObjectWithSelection, public IObjectWithSite {
     LONG refs=1;
+    LPCWSTR nativeVerb;
     Com<IShellItemArray> selection;
     Com<IUnknown> site;
     using ShellString=std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)>;
@@ -44,7 +46,7 @@ class DesktopOpen final : public IExecuteCommand, public IObjectWithSelection, p
                 if (SUCCEEDED(site->QueryInterface(IID_PPV_ARGS(&owner.p)))) owner->GetWindow(&execute.hwnd);
             }
             execute.lpClass=L"Folder";
-            execute.lpVerb=L"open";
+            execute.lpVerb=nativeVerb;
             execute.lpIDList=folder.get();
             execute.lpParameters=parameters.get();
             execute.lpDirectory=directory.get();
@@ -61,24 +63,15 @@ class DesktopOpen final : public IExecuteCommand, public IObjectWithSelection, p
             SUCCEEDED(services->QueryService(SID_STopLevelBrowser,IID_PPV_ARGS(&browser.p))) && browser.p &&
             SUCCEEDED(browser->GetWindow(&owner)) && merge::frame(owner);
     }
-    bool openDesktopFolder() {
+    bool openExternalFolder() {
         if (keys&(MK_CONTROL|MK_SHIFT) || show==SW_HIDE || parameters || !selection.p || inFolderWindow()) return false;
-        Com<IShellItem> item,parent;
+        Com<IShellItem> item;
         DWORD count=0;
         SFGAOF attrs=0;
         if (FAILED(selection->GetCount(&count)) || count!=1 || FAILED(selection->GetItemAt(0,&item.p)) ||
             FAILED(item->GetAttributes(SFGAO_FOLDER|SFGAO_FILESYSTEM|SFGAO_LINK,&attrs)) ||
-            attrs!=(SFGAO_FOLDER|SFGAO_FILESYSTEM) || FAILED(item->GetParent(&parent.p))) return false;
+            attrs!=(SFGAO_FOLDER|SFGAO_FILESYSTEM)) return false;
         PWSTR raw=nullptr;
-        if (FAILED(parent->GetDisplayName(SIGDN_FILESYSPATH,&raw))) return false;
-        std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> directory(raw,CoTaskMemFree);
-        bool desktop=false;
-        for (auto known : {FOLDERID_Desktop,FOLDERID_PublicDesktop}) {
-            if (FAILED(SHGetKnownFolderPath(known,KF_FLAG_DONT_VERIFY,nullptr,&raw))) continue;
-            std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> expected(raw,CoTaskMemFree);
-            if (CompareStringOrdinal(directory.get(),-1,expected.get(),-1,TRUE)==CSTR_EQUAL) { desktop=true; break; }
-        }
-        if (!desktop) return false;
         HWND target=merge::target(nullptr);
         if (!target || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH,&raw))) return false;
         std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(raw,CoTaskMemFree);
@@ -87,8 +80,8 @@ class DesktopOpen final : public IExecuteCommand, public IObjectWithSelection, p
         return merge::sendPath(target,nullptr,merge::openPath(),path.get());
     }
 public:
-    DesktopOpen() { InterlockedIncrement(&objects); }
-    ~DesktopOpen() { InterlockedDecrement(&objects); }
+    explicit FolderOpen(LPCWSTR verb) : nativeVerb(verb) { InterlockedIncrement(&objects); }
+    ~FolderOpen() { InterlockedDecrement(&objects); }
     STDMETHODIMP QueryInterface(REFIID iid,void** out) override {
         if (!out) return E_POINTER;
         *out=nullptr;
@@ -122,5 +115,5 @@ public:
     STDMETHODIMP SetShowWindow(int n) override { show=n; return S_OK; }
     STDMETHODIMP SetNoShowUI(BOOL b) override { silent=b; return S_OK; }
     STDMETHODIMP SetDirectory(LPCWSTR p) override { return setString(directory,p); }
-    STDMETHODIMP Execute() override { return openDesktopFolder() ? S_OK : openNative(); }
+    STDMETHODIMP Execute() override { return openExternalFolder() ? S_OK : openNative(); }
 };

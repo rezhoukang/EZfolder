@@ -1373,9 +1373,9 @@ public:
 
 class Factory final : public IClassFactory {
     LONG refs = 1;
-    bool desktop;
+    LPCWSTR folderVerb;
 public:
-    explicit Factory(bool forDesktop) : desktop(forDesktop) { InterlockedIncrement(&objects); }
+    explicit Factory(LPCWSTR verb) : folderVerb(verb) { InterlockedIncrement(&objects); }
     ~Factory() { InterlockedDecrement(&objects); }
     STDMETHODIMP QueryInterface(REFIID id, void** out) override {
         if (!out) return E_POINTER;
@@ -1391,7 +1391,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (outer) return CLASS_E_NOAGGREGATION;
-        IUnknown* obj = desktop ? static_cast<IExecuteCommand*>(new(std::nothrow) DesktopOpen) :
+        IUnknown* obj = folderVerb ? static_cast<IExecuteCommand*>(new(std::nothrow) FolderOpen(folderVerb)) :
             static_cast<IUnknown*>(static_cast<IDeskBand*>(new(std::nothrow) Band));
         if (!obj) return E_OUTOFMEMORY;
         HRESULT hr = obj->QueryInterface(id, out);
@@ -1407,8 +1407,11 @@ public:
 extern "C" __declspec(dllexport) HRESULT WINAPI DllGetClassObject(REFCLSID id, REFIID iid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (id != clsid && id!=desktopOpenId) return CLASS_E_CLASSNOTAVAILABLE;
-    auto* factory = new(std::nothrow) Factory(id==desktopOpenId);
+    LPCWSTR verb = nullptr;
+    if (id==desktopOpenId) verb=L"open";
+    else if (id==exploreFolderId) verb=L"explore";
+    else if (id!=clsid) return CLASS_E_CLASSNOTAVAILABLE;
+    auto* factory = new(std::nothrow) Factory(verb);
     if (!factory) return E_OUTOFMEMORY;
     HRESULT hr = factory->QueryInterface(iid, out);
     factory->Release();

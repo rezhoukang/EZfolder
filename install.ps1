@@ -5,7 +5,10 @@ $legacyId = '{6751F5D7-8C60-4B05-9A79-6EB61FABED30}'
 $class = "Software\Classes\CLSID\$id"
 $handlerId = '{885E4B09-DA21-42F4-BD05-8A91FBE8FBA6}'
 $handlerClass = "Software\Classes\CLSID\$handlerId"
+$exploreId = '{0E630A37-A7EF-4AC7-A762-9D501A3D4D05}'
+$exploreClass = "Software\Classes\CLSID\$exploreId"
 $directoryShell = 'Software\Classes\Directory\shell'
+$exploreVerb = "$directoryShell\explore"
 $desktopVerb = 'EZFolder.Open'
 $backupKey = 'Software\EZFolder\DirectoryVerbBackup'
 $userRegistry = [Microsoft.Win32.Registry]::CurrentUser
@@ -22,6 +25,24 @@ $menu = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'EZFolder'
 $labels = @{ Enable = '开启 EZFolder'; Disable = '关闭 EZFolder' }
 try {
     if ($Uninstall) {
+        $command=$userRegistry.OpenSubKey("$exploreVerb\command",$true)
+        if ($command) {
+            try {
+                if ($command.GetValue('DelegateExecute') -eq $exploreId) {
+                    $command.DeleteValue('DelegateExecute')
+                    if (!$command.ValueCount -and !$command.SubKeyCount) {
+                        $userRegistry.DeleteSubKey("$exploreVerb\command")
+                        $verb=$userRegistry.OpenSubKey($exploreVerb,$true)
+                        try {
+                            if ($verb.GetValue('ProgrammaticAccessOnly') -ceq '') { $verb.DeleteValue('ProgrammaticAccessOnly') }
+                            if ($verb.GetValue('MultiSelectModel') -ceq 'Player') { $verb.DeleteValue('MultiSelectModel') }
+                            if (!$verb.ValueCount -and !$verb.SubKeyCount) { $userRegistry.DeleteSubKey($exploreVerb) }
+                        } finally { $verb.Dispose() }
+                    }
+                }
+            } finally { $command.Dispose() }
+        }
+        $userRegistry.DeleteSubKeyTree($exploreClass,$false)
         $shellKey=$userRegistry.OpenSubKey($directoryShell,$true)
         $backup=$userRegistry.OpenSubKey($backupKey)
         if ($shellKey) {
@@ -99,6 +120,25 @@ try {
                 $shellKey.SetValue('',$desktopVerb)
             } finally { $shellKey.Dispose() }
         } else { Write-Warning 'Keeping the existing custom folder command. Ordinary window merging remains available.' }
+        # Shell.Application.Explore requests the programmatic explore verb.
+        # Register it only for filesystem directories with the stock Folder fallback.
+        $existing=Get-Item 'Registry::HKEY_CLASSES_ROOT\Directory\shell\explore' -ErrorAction SilentlyContinue
+        $command=Get-Item 'Registry::HKEY_CLASSES_ROOT\Directory\shell\explore\command' -ErrorAction SilentlyContinue
+        $fallback=Get-Item 'Registry::HKEY_CLASSES_ROOT\Folder\shell\explore\command' -ErrorAction SilentlyContinue
+        if ($fallback -and $fallback.GetValue('DelegateExecute') -eq '{11DBB47C-A525-400B-9E80-A54615A090C0}' -and
+            (!$existing -or ($command -and $command.GetValue('DelegateExecute') -eq $exploreId))) {
+            $key=$userRegistry.CreateSubKey("$exploreClass\InprocServer32")
+            try { $key.SetValue('',$dll); $key.SetValue('ThreadingModel','Apartment') } finally { $key.Dispose() }
+            if (!$existing) {
+                $verb=$userRegistry.CreateSubKey($exploreVerb)
+                try {
+                    $verb.SetValue('ProgrammaticAccessOnly','')
+                    $verb.SetValue('MultiSelectModel','Player')
+                    $key=$verb.CreateSubKey('command')
+                    try { $key.SetValue('DelegateExecute',$exploreId) } finally { $key.Dispose() }
+                } finally { $verb.Dispose() }
+            }
+        }
         $key = $registry.CreateSubKey($toolbar)
         try { $key.SetValue($id, 'EZFolder') } finally { $key.Dispose() }
         $controller = Join-Path $installDir 'visibility.ps1'
