@@ -104,11 +104,13 @@ public static class RibbonEntryTest {
         return FindWindowEx(w,IntPtr.Zero,"Windows.UI.Composition.DesktopWindowContentBridge",null);
     }
     [DllImport("user32")] static extern bool GetMenuItemRect(IntPtr w,IntPtr menu,int pos,out Rect rect);
+    [DllImport("user32")] static extern int GetMenuItemCount(IntPtr menu);
     [DllImport("user32")] static extern void mouse_event(uint flags,int dx,int dy,uint data,UIntPtr extra);
     public static void Pick(IntPtr popup,int pos) {
         IntPtr menu; Rect rect;
         if (SendMessageTimeout(popup,0x1E1,IntPtr.Zero,IntPtr.Zero,2,300,out menu)==IntPtr.Zero ||
             !GetMenuItemRect(IntPtr.Zero,menu,pos,out rect)) throw new Exception("Cannot locate choice");
+        if (GetMenuItemCount(menu)!=4) throw new Exception("Expected three EZFolder commands and a separator");
         Point pt=new Point((rect.Left+rect.Right)/2,(rect.Top+rect.Bottom)/2);
         if (WindowFromPoint(pt)!=popup) throw new Exception("Choice is covered");
         SetCursorPos(pt.X,pt.Y);
@@ -205,13 +207,15 @@ function Test-TabActions {
     [void][IO.Directory]::CreateDirectory($child)
     $other=$null
     try {
-        Pick-Action $root 2
-        Wait-For 'duplicated tab' { [RibbonEntryTest]::TabCount($tabs) -eq 2 } | Out-Null
+        [RibbonEntryTest]::NewTab($bar)
+        Wait-For 'new tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        $window.Navigate2($folder)
+        Wait-For 'test folder in second tab' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
         $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Moved')
         $item=Wait-For 'visible child folder' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$name) }
         $hit=$item.GetClickablePoint()
         [RibbonEntryTest]::OpenItem($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
-        Wait-For 'changed duplicate' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
+        Wait-For 'subfolder in second tab' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
         if ([RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Opening a subfolder created another tab.' }
         Start-Sleep -Milliseconds 550
         $dpi=[RibbonEntryTest]::GetDpiForWindow($tabs)
@@ -223,9 +227,9 @@ function Test-TabActions {
         } | Out-Null
         [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
         Wait-For 'restored tab closed again' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
-        Pick-Action $tabs 4
+        Pick-Action $root 3
         Wait-For 'restored closed directory' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $child } | Out-Null
-        Pick-Action $tabs 3
+        Pick-Action $tabs 2
         $other=Wait-For 'independent copy' { $shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and $_.Document.Folder.Self.Path -eq $child } | Select-Object -First 1 }
         if ([RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Opening in a new window removed the original tab.' }
         $otherRoot=[IntPtr][long]$other.HWND
@@ -245,7 +249,7 @@ function Test-TabActions {
             [RibbonEntryTest]::TabCount($tabs) -eq 1 -and [RibbonEntryTest]::TabCount($otherTabs) -eq 2 -and
                 $window.Document.Folder.Self.Path -eq $child -and $other.Document.Folder.Self.Path -eq $folder
         } | Out-Null
-        'PASS: duplicate, restore, independent copy, drag preview and acknowledged cross-window move.'
+        'PASS: status bar restore, new window from tab menu, drag preview and acknowledged cross-window move.'
         if ($TestRouting) {
             $competing=@($shell.Windows() | Where-Object { $_.HWND -notin @($window.HWND,$other.HWND) -and [RibbonEntryTest]::Shown([IntPtr][long]$_.HWND) })
             if ($competing.Count) { throw 'Routing test needs two isolated Explorer frames.' }

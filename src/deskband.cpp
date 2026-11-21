@@ -685,7 +685,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         SetForegroundWindow(root);
         schedule(25);
     }
-    enum MenuCommand { Settings=200, Duplicate, NewWindow, Restore };
+    enum MenuCommand { Settings=200, NewWindow, Restore };
     void restoreClosedTab() {
         if (closed.empty() || !hasRoom() || destination>=0 || separating>=0 || incoming || queuedTab>=0 || storing) return;
         pendingNew=append(Location(ILCloneFull(closed.back().get())),false);
@@ -707,15 +707,15 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         Location clicked(index>=0 ? ILCloneFull(folders[index].get()) : nullptr);
         HMENU menu=CreatePopupMenu();
         if (!menu) return;
-        const wchar_t* names[]={L"设置",L"复制此标签页",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
-        bool enabled[]={true,idle && clicked && hasRoom(),idle && clicked,idle && hasRoom() && !closed.empty()};
-        MSAAMENUINFO accessible[4]{};
+        const wchar_t* names[]={L"设置",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
+        bool enabled[]={true,idle && clicked,idle && hasRoom() && !closed.empty()};
+        MSAAMENUINFO accessible[ARRAYSIZE(names)]{};
         HBRUSH bg=theme.darkMenu()?CreateSolidBrush(RGB(43,43,43)):nullptr;
         if (bg) {
             MENUINFO info{}; info.cbSize=sizeof(info); info.fMask=MIM_BACKGROUND; info.hbrBack=bg;
             SetMenuInfo(menu,&info);
         }
-        for (UINT i=0;i<4;++i) {
+        for (UINT i=0;i<ARRAYSIZE(names);++i) {
             if (i==1) AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
             MENUITEMINFOW entry{}; entry.cbSize=sizeof(entry); entry.wID=Settings+i;
             entry.fMask=MIIM_ID|MIIM_FTYPE|MIIM_STRING|MIIM_STATE;
@@ -743,9 +743,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             separate(index,{r.left+scale(96),r.top+scale(80)},true);
         } else if (choice==Restore) {
             restoreClosedTab();
-        } else if (choice==Duplicate && hasRoom()) {
-            pendingNew=append(std::move(clicked),false);
-            if (pendingNew>=0) select(pendingNew);
         }
     }
     static LRESULT CALLBACK hostMenuProc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR data) {
