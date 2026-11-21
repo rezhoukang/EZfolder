@@ -1,4 +1,4 @@
-﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation,[switch]$TestQuickDrop,[switch]$TestCtrlOpen)
+﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation,[switch]$TestQuickDrop,[switch]$TestCtrlOpen,[switch]$TestNewTabShortcut)
 $ErrorActionPreference = 'Stop'
 Add-Type -ReferencedAssemblies Accessibility -TypeDefinition @'
 using System;
@@ -88,7 +88,18 @@ public static class RibbonEntryTest {
     struct GuiInfo { public int size,flags; public IntPtr active,focus,capture,menu,move,caret; public Rect rect; }
     [DllImport("user32")] static extern bool GetGUIThreadInfo(uint thread,ref GuiInfo info);
     public static bool Focused(IntPtr w) { var g=new GuiInfo();g.size=Marshal.SizeOf(g);return GetGUIThreadInfo(0,ref g)&&g.focus==w; }
+    public static bool AddressFocused() {
+        var g=new GuiInfo(); g.size=Marshal.SizeOf(g);
+        if (!GetGUIThreadInfo(0,ref g)) return false;
+        var name=new StringBuilder(64);
+        for (IntPtr w=g.focus;w!=IntPtr.Zero;w=GetParent(w)) {
+            GetClassName(w,name,name.Capacity);
+            if (name.ToString()=="Address Band Root") return true;
+        }
+        return false;
+    }
     [DllImport("user32")] static extern IntPtr GetForegroundWindow();
+    public static bool Foreground(IntPtr w) { return GetForegroundWindow()==w; }
     [DllImport("user32")] static extern void keybd_event(byte key,byte scan,uint flags,UIntPtr extra);
     public static void HoldCtrl(bool down) { keybd_event(17,0,down ? 0u : 2u,UIntPtr.Zero); }
     public static void RestoreShortcut(IntPtr root,IntPtr tabs) {
@@ -256,6 +267,55 @@ function Test-Placement {
     $point = [RibbonEntryTest+Point]::new(($r.Left+$r.Right)/2,($r.Top+$r.Bottom)/2)
     return ([math]::Abs($dock.Right-$r.Right-$margin) -le 1 -and $r.Top -eq $dock.Top -and
         [RibbonEntryTest]::WindowFromPoint($point) -eq $button)
+}
+function Test-NewTabShortcut {
+    Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+    $window.Left=70; $window.Top=70; $window.Width=900; $window.Height=600
+    $bar=[FixtureWindow]::GetProp($root,'EZFolder.Band.2')
+    $tabs=[RibbonEntryTest]::GetDlgItem($bar,102)
+    $plus=[RibbonEntryTest]::GetDlgItem($bar,100)
+    $settings=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\EZFolder')
+    $prior=$settings.GetValue('PreferencesV1')
+    $defaults=[byte[]]::new(28)
+    foreach ($i in 0..6) {
+        [BitConverter]::GetBytes(@(0,0x154,0x157,0x109,0x309,0x354,3)[$i]).CopyTo($defaults,4*$i)
+    }
+    $itemPath=Join-Path $folder 'ShortcutTarget'
+    [void][IO.Directory]::CreateDirectory($itemPath)
+    try {
+        $settings.SetValue('PreferencesV1',$defaults,[Microsoft.Win32.RegistryValueKind]::Binary)
+        $frame=[Windows.Automation.AutomationElement]::FromHandle($root)
+        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'ShortcutTarget')
+        $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
+        $item=Wait-For 'shortcut target in file view' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($name,$type)) }
+        Wait-For 'shortcut fixture is foreground' {
+            if (![RibbonEntryTest]::Foreground($root)) { [void][RibbonEntryTest]::SetForegroundWindow($root) }
+            [RibbonEntryTest]::Foreground($root)
+        } | Out-Null
+        $item.SetFocus()
+        if ([RibbonEntryTest]::Focused($tabs) -or [RibbonEntryTest]::Focused($plus)) { throw 'Expected focus in file view.' }
+        $pc=(New-Object -ComObject Shell.Application).NameSpace(17).Self.Path
+        [RibbonEntryTest]::CtrlKey($root,84)
+        Wait-For 'Ctrl+T from the file view opens a tab' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 1 -and
+                [RibbonEntryTest]::IsWindowEnabled($tabs) -and $window.Document.Folder.Self.Path -eq $pc
+        } | Out-Null
+        [RibbonEntryTest]::CtrlKey($root,76)
+        Wait-For 'address bar focused' { [RibbonEntryTest]::AddressFocused() } | Out-Null
+        [RibbonEntryTest]::CtrlKey($root,84)
+        Wait-For 'Ctrl+T from the address bar opens one more tab' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 3 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 2 -and
+                [RibbonEntryTest]::IsWindowEnabled($tabs)
+        } | Out-Null
+        [RibbonEntryTest]::FocusTabs($root,$tabs)
+        Wait-For 'original folder preserved' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        'PASS: Ctrl+T opens a new tab from the file view and address bar and preserves the original folder.'
+    } finally {
+        if ($null -eq $prior) { $settings.DeleteValue('PreferencesV1',$false) }
+        else { $settings.SetValue('PreferencesV1',$prior,[Microsoft.Win32.RegistryValueKind]::Binary) }
+        $settings.Dispose()
+        [IO.Directory]::Delete($itemPath)
+    }
 }
 function Test-WindowCtrlOpen {
     Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes,System.Windows.Forms
@@ -743,12 +803,12 @@ try {
     $entry = [IntPtr](Wait-For 'ribbon entry' { [RibbonEntryTest]::Entry($root).ToInt64() })
     $button = [RibbonEntryTest]::GetDlgItem($entry,1)
     $initiallyShown = [RibbonEntryTest]::Shown($root)
-    if ($TestNavigation -or $TestQuickDrop -or $TestCtrlOpen) {
+    if ($TestNavigation -or $TestQuickDrop -or $TestCtrlOpen -or $TestNewTabShortcut) {
         if (!$initiallyShown) {
             [RibbonEntryTest]::Click($button)
             Wait-For 'navigation fixture band' { [RibbonEntryTest]::Shown($root) } | Out-Null
         }
-        if ($TestQuickDrop) { Test-SingleQuickDrop } elseif ($TestCtrlOpen) { Test-WindowCtrlOpen } else { Test-TabActions }
+        if ($TestQuickDrop) { Test-SingleQuickDrop } elseif ($TestCtrlOpen) { Test-WindowCtrlOpen } elseif ($TestNewTabShortcut) { Test-NewTabShortcut } else { Test-TabActions }
         return
     }
     if ($initiallyShown) { [RibbonEntryTest]::Click($button); Wait-For 'initial hide' { ![RibbonEntryTest]::Shown($root) } | Out-Null }

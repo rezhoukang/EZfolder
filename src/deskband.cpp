@@ -1395,7 +1395,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             return;
         }
         int action=shortcutFor(msg.wParam);
-        bool windowShortcut=action==settings::Close || action==settings::Restore;
+        bool windowShortcut=action==settings::New || action==settings::Close || action==settings::Restore;
         if (windowShortcut || (action>=0 && (msg.hwnd==tabs || msg.hwnd==add))) {
             bool repeat=windowShortcut && (msg.lParam & (1L<<30));
             msg.hwnd=bar;
