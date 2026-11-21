@@ -108,12 +108,6 @@ class BandTheme {
         }
     }
 public:
-    HBRUSH labelBrush(HDC dc) const {
-        SetTextColor(dc,text);
-        SetBkColor(dc,background);
-        SetDCBrushColor(dc,background);
-        return static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
-    }
     int loading=-1;
     bool darkMenu() const { return background==RGB(0,0,0) && surface==RGB(48,48,48); }
     void menuItem(const DRAWITEMSTRUCT& item,int dpi) const {

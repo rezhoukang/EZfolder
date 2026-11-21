@@ -39,7 +39,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     LONG refs = 1;
     Com<IUnknown> site;
     Com<IShellBrowser> browser;
-    HWND bar = nullptr, tabs = nullptr, add = nullptr, locationLabel = nullptr;
+    HWND bar = nullptr, tabs = nullptr, add = nullptr;
     SIZE stripSize{-1,-1}, itemSize{-1,-1};
     HWND tooltip = nullptr;
     TOOLINFOW tipTool{};
@@ -52,7 +52,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     struct Tab { Location folder; std::wstring title, path; };
     std::vector<Tab> folders;
     int active = -1, destination = -1;
-    // The native view can own a location without any corresponding tab item.
+    // The default page after closing the last tab has no tab of its own.
     Location nativeLocation, closingTo;
     bool closeAfterSwitch = false;
     bool rememberRemoval = false, restoring = false, copyToWindow = false, dragging = false;
@@ -462,7 +462,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         // Reserve space before the native control decides whether to show its overflow buttons.
         layout();
         if (!label(index, true)) { folders.pop_back(); layout(); return -1; }
-        if (activate) active = index;
+        if (activate) {
+            active = index;
+            nativeLocation.reset();
+        }
         controls();
         return index;
     }
@@ -569,13 +572,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (msg==WM_NCDESTROY && self->loadingCover==w) self->loadingCover=nullptr;
         return DefSubclassProc(w,msg,wp,lp);
     }
-    void setNativeLocation(Location id) {
-        nativeLocation=std::move(id);
-        PWSTR name=nullptr;
-        SHGetNameFromIDList(nativeLocation.get(),SIGDN_NORMALDISPLAY,&name);
-        SetWindowTextW(locationLabel,name ? name : L"");
-        CoTaskMemFree(name);
-    }
     void completeSwitch() {
         int previous = active;
         active = destination;
@@ -585,7 +581,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             if (rememberRemoval) remember(last);
             active=-1;
             erase(last);
-            setNativeLocation(std::move(closingTo));
+            nativeLocation=std::move(closingTo);
         } else if (closeAfterSwitch) {
             if (rememberRemoval) remember(previous);
             erase(previous);
@@ -619,16 +615,16 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             MessageBeep(MB_ICONWARNING);
         }
         if (!actual) return;
-        if (nativeLocation) {
-            if (!ILIsEqual(actual.get(),nativeLocation.get())) setNativeLocation(std::move(actual));
-        } else if (active < 0) append(std::move(actual));
-        else if (!ILIsEqual(actual.get(), folders[active].folder.get())) {
+        if (nativeLocation && ILIsEqual(actual.get(),nativeLocation.get())) return;
+        if (folders.empty()) append(std::move(actual));
+        else if (active<0 || !ILIsEqual(actual.get(), folders[active].folder.get())) {
             nextImported = -1;
             int match=matchingTab(actual.get());
             if (match>=0 && match!=active) {
                 // Explorer already displays the destination. Adopt its view without
                 // navigating again or replacing the folder stored in the source tab.
                 active=match;
+                nativeLocation.reset();
                 if (!ILIsEqual(actual.get(),folders[match].folder.get())) {
                     folders[match].folder=std::move(actual);
                     label(match,false);
@@ -637,8 +633,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 else moveTabToEnd(match,tracked);
                 return;
             }
-            folders[active].folder = std::move(actual);
-            label(active, false);
+            if (active<0) append(std::move(actual));
+            else {
+                folders[active].folder = std::move(actual);
+                label(active, false);
+            }
         }
     }
     void select(int index, bool removePrevious = false, bool saveClosed = false, Location closeTarget = {}) {
@@ -1085,7 +1084,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             else RemovePropW(bar,merge::emptyProp);
             if (plain && GetFocus()==tabs) SetFocus(add);
             ShowWindow(tabs,plain ? SW_HIDE : SW_SHOWNA);
-            ShowWindow(locationLabel,plain ? SW_SHOWNA : SW_HIDE);
         }
         EnableWindow(add,room && (active >= 0 || nativeLocation) && destination < 0 && separating < 0);
         int item = std::clamp((available-scale(6))/count,1,scale(132));
@@ -1098,8 +1096,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             itemSize = {item,height};
         }
         if (resize) {
-            int inset=scale(7);
-            MoveWindow(locationLabel,inset,0,std::max(0,available-inset),r.bottom,FALSE);
             if (available < stripSize.cx) MoveWindow(tabs,0,0,available,r.bottom,FALSE);
             MoveWindow(add,available,0,button,r.bottom,FALSE);
             stripSize = {available,r.bottom};
@@ -1264,10 +1260,6 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 return 0;
             }
             switch (msg) {
-            case WM_CTLCOLORSTATIC:
-                if (reinterpret_cast<HWND>(lp)==self->locationLabel)
-                    return reinterpret_cast<LRESULT>(self->theme.labelBrush(reinterpret_cast<HDC>(wp)));
-                break;
             case WM_THEMECHANGED: case WM_SYSCOLORCHANGE: case WM_SETTINGCHANGE:
                 self->theme.refresh(w, self->tooltip, true);
                 break;
@@ -1356,14 +1348,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         tabs = child(WC_TABCONTROLW, L"文件夹标签", TabControl,
                      TCS_MULTILINE | TCS_RAGGEDRIGHT | TCS_FIXEDWIDTH | TCS_FOCUSONBUTTONDOWN | WS_CLIPCHILDREN);
         add = child(WC_BUTTONW, L"新建标签页", NewTab, BS_OWNERDRAW);
-        locationLabel=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_CENTERIMAGE|SS_NOPREFIX|SS_ENDELLIPSIS,
-            0,0,0,0,bar,reinterpret_cast<HMENU>(104),module,nullptr);
-        if (!locationLabel) return E_FAIL;
         NONCLIENTMETRICSW metrics{};
         metrics.cbSize = sizeof(metrics);
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
             font = CreateFontIndirectW(&metrics.lfMessageFont);
-        SendMessageW(locationLabel,WM_SETFONT,reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)),FALSE);
         for (HWND w : {tabs, add}) {
             if (!w || !SetWindowSubclass(w, childProc, 1, reinterpret_cast<DWORD_PTR>(this))) return E_FAIL;
             SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)), FALSE);
@@ -1413,7 +1401,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         tooltip = nullptr;
         tipTitle.reset();
         if (bar) DestroyWindow(bar);
-        bar = tabs = add = locationLabel = nullptr;
+        bar = tabs = add = nullptr;
         stripSize = itemSize = {-1,-1};
         if (font) { DeleteObject(font); font = nullptr; }
         folders.clear();

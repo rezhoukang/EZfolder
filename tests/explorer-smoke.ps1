@@ -75,11 +75,9 @@ public static class BandTest {
     [DllImport("user32")] static extern uint GetWindowThreadProcessId(IntPtr w,out uint pid);
     [DllImport("user32",CharSet=CharSet.Unicode,EntryPoint="SendMessageTimeoutW")]
     static extern IntPtr ReadText(IntPtr w,int m,IntPtr a,System.Text.StringBuilder b,int flags,int ms,out IntPtr result);
-    public static bool PlainLocation(IntPtr bar,string name) {
-        IntPtr label=GetDlgItem(bar,104),result;
-        var text=new System.Text.StringBuilder(256);
-        return !String.IsNullOrEmpty(name) && Count(bar)==0 && Index(bar)==-1 && !IsWindowVisible(GetDlgItem(bar,102)) &&
-            IsWindowVisible(label) && ReadText(label,13,(IntPtr)text.Capacity,text,2,500,out result)!=IntPtr.Zero && text.ToString()==name;
+    public static bool EmptyStrip(IntPtr bar) {
+        return Count(bar)==0 && Index(bar)==-1 && !IsWindowVisible(GetDlgItem(bar,102)) &&
+            GetDlgItem(bar,104)==IntPtr.Zero && IsWindowVisible(GetDlgItem(bar,100));
     }
     public static bool HasTitle(IntPtr tabs,string title) {
         uint owner,pid; GetWindowThreadProcessId(tabs,out owner);
@@ -250,14 +248,36 @@ try {
     $independent.Quit()
     $testWindows = @()
     [void][BandTest]::Send($tabs,0x208,0,((8 -shl 16) -bor 12))
-    Wait-For 'middle-close leaves only the native Quick Access label' { $window.Document.Folder.Self.Path -match '679f85cb' -and [BandTest]::PlainLocation($bar,$window.Document.Folder.Self.Name) } | Out-Null
+    Wait-For 'middle-close leaves Quick Access with a blank strip' { $window.Document.Folder.Self.Path -match '679f85cb' -and [BandTest]::EmptyStrip($bar) } | Out-Null
+    $window.Navigate2($child)
+    Wait-For 'leaving Quick Access creates one selected directory tab' {
+        $window.Document.Folder.Self.Path -eq $child -and [BandTest]::Count($bar) -eq 1 -and [BandTest]::Index($bar) -eq 0 -and [BandTest]::IsWindowVisible($tabs)
+    } | Out-Null
+    [void][BandTest]::Send($tabs,0x208,0,((8 -shl 16) -bor 12))
+    Wait-For 'closing the new directory tab returns to blank Quick Access' { $window.Document.Folder.Self.Path -match '679f85cb' -and [BandTest]::EmptyStrip($bar) } | Out-Null
     [void][BandTest]::Send($plus,0xF5,0,0)
     Wait-For 'plus creates the first real tab even at the same location' { [BandTest]::Count($bar) -eq 1 -and [BandTest]::Index($bar) -eq 0 -and [BandTest]::IsWindowVisible($tabs) } | Out-Null
     $settings.SetValue('NewTabLocation',0,[Microsoft.Win32.RegistryValueKind]::DWord)
     [BandTest]::ClickTab($bar,[BandTest]::ItemWidth($tabs)-[int](8*$dpi/96))
-    Wait-For 'last tab X leaves only the native This PC label' { $window.Document.Folder.Self.Path -eq $pc -and [BandTest]::PlainLocation($bar,$window.Document.Folder.Self.Name) } | Out-Null
-    $window.Navigate2($folder)
-    Wait-For 'native navigation keeps the bar empty and updates the label' { $window.Document.Folder.Self.Path -eq $folder -and [BandTest]::PlainLocation($bar,$window.Document.Folder.Self.Name) } | Out-Null
+    Wait-For 'last tab X leaves This PC with a blank strip' { $window.Document.Folder.Self.Path -eq $pc -and [BandTest]::EmptyStrip($bar) } | Out-Null
+    $drive=[IO.Path]::GetPathRoot($folder)
+    $item=Wait-For 'system drive in This PC' { $window.Document.Folder.Items() | Where-Object { $_.Path -eq $drive } | Select-Object -First 1 }
+    $window.Document.SelectItem($item,29)
+    if (![BandTest]::EmptyStrip($bar)) { throw 'Selecting an item without opening it created a tab.' }
+    Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+    $frame=[Windows.Automation.AutomationElement]::FromHandle($root)
+    $selected=[Windows.Automation.PropertyCondition]::new([Windows.Automation.SelectionItemPattern]::IsSelectedProperty,$true)
+    $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
+    $entry=Wait-For 'selected drive item' {
+        $frame.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($selected,$type)) |
+            Where-Object { $_.Current.Name.Contains($drive.TrimEnd('\')) } | Select-Object -First 1
+    }
+    $entry.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Wait-For 'opening the drive creates one selected directory tab' {
+        $window.Document.Folder.Self.Path -eq $drive -and [BandTest]::Count($bar) -eq 1 -and [BandTest]::Index($bar) -eq 0 -and [BandTest]::IsWindowVisible($tabs)
+    } | Out-Null
+    [void][BandTest]::Send($tabs,0x208,0,((8 -shl 16) -bor 12))
+    Wait-For 'blank This PC ready for external open' { $window.Document.Folder.Self.Path -eq $pc -and [BandTest]::EmptyStrip($bar) } | Out-Null
     'PASS: This PC, Quick Access, per-tab close, switching and drag-out.'
     if (@($shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and [BandTest]::IsWindowVisible([FixtureWindow]::GetProp([IntPtr][long]$_.HWND,'EZFolder.Band.2')) }).Count) {
         'SKIP: another band is open and could receive the test merge.'
@@ -271,7 +291,7 @@ try {
     } | Out-Null
     Wait-For 'new window closes after the target receives its folder' {
         $extra = @($shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and $_.Document.Folder.Self.Path -eq $folder })
-        $extra.Count -eq 0
+        $extra.Count -eq 0 -and [BandTest]::IsWindowEnabled($tabs)
     } | Out-Null
     [BandTest]::ClickTab($bar,12)
     Wait-For 'original tab still holds its folder' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
@@ -304,6 +324,9 @@ try {
     Wait-For 'two more new windows become two tabs' { [BandTest]::Count($bar) -eq 4 } | Out-Null
     Wait-For 'both newly opened windows have handed off' {
         !@($shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and $_.Document.Folder.Self.Path -in $burst }).Count
+    } | Out-Null
+    Wait-For 'last merged tab is selected and ready to close' {
+        [BandTest]::Index($bar) -eq 3 -and [BandTest]::IsWindowEnabled($tabs) -and $window.Document.Folder.Self.Path -in $burst
     } | Out-Null
     $visited = @($window.Document.Folder.Self.Path)
     [void][BandTest]::Send($tabs,0x208,0,((8 -shl 16) -bor (([BandTest]::Index($bar)*[BandTest]::ItemWidth($tabs))+12)))
