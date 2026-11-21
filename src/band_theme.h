@@ -164,15 +164,14 @@ class BandTheme {
 public:
     int loading=-1;
     bool darkMenu() const { return background==RGB(0,0,0) && surface==RGB(48,48,48); }
-    void menuItem(const DRAWITEMSTRUCT& item,int dpi) const {
+    void menuItem(const DRAWITEMSTRUCT& item,int dpi,HFONT font) const {
         auto* data=reinterpret_cast<const MSAAMENUINFO*>(item.itemData);
         if (!data) return;
         int saved=SaveDC(item.hDC);
         RECT r=item.rcItem;
         fill(item.hDC,r,item.itemState&ODS_SELECTED ? RGB(65,65,65) : RGB(43,43,43));
-        r.left+=MulDiv(23,dpi,96);
-        line(item.hDC,r.left,r.top,r.left,r.bottom,edge);
         r.left+=MulDiv(8,dpi,96);
+        SelectObject(item.hDC,font ? font : GetStockObject(DEFAULT_GUI_FONT));
         SetTextColor(item.hDC,item.itemState&ODS_DISABLED ? GetSysColor(COLOR_GRAYTEXT) : text);
         SetBkMode(item.hDC,TRANSPARENT);
         DrawTextW(item.hDC,data->pszWText,-1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);

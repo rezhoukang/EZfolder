@@ -814,22 +814,26 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         Location clicked(index>=0 ? ILCloneFull(folders[index].folder.get()) : nullptr);
         HMENU menu=CreatePopupMenu();
         if (!menu) return;
-        const wchar_t* names[]={L"设置",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
-        bool enabled[]={true,idle && clicked,idle && hasRoom() && !closed.empty()};
-        MSAAMENUINFO accessible[ARRAYSIZE(names)]{};
+        struct Command { UINT id; const wchar_t* name; bool enabled; };
+        const Command commands[]={
+            {NewWindow,L"在新窗口打开此标签页",idle && clicked},
+            {Restore,L"恢复上个关闭的标签页",idle && hasRoom() && !closed.empty()},
+            {Settings,L"设置",true}
+        };
+        MSAAMENUINFO accessible[ARRAYSIZE(commands)]{};
         HBRUSH bg=theme.darkMenu()?CreateSolidBrush(RGB(43,43,43)):nullptr;
-        if (bg) {
-            MENUINFO info{}; info.cbSize=sizeof(info); info.fMask=MIM_BACKGROUND; info.hbrBack=bg;
-            SetMenuInfo(menu,&info);
-        }
-        for (UINT i=0;i<ARRAYSIZE(names);++i) {
-            if (i==1) AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
-            MENUITEMINFOW entry{}; entry.cbSize=sizeof(entry); entry.wID=Settings+i;
+        MENUINFO info{}; info.cbSize=sizeof(info); info.fMask=MIM_STYLE; info.dwStyle=MNS_NOCHECK;
+        if (bg) { info.fMask|=MIM_BACKGROUND; info.hbrBack=bg; }
+        SetMenuInfo(menu,&info);
+        for (UINT i=0;i<ARRAYSIZE(commands);++i) {
+            const auto& command=commands[i];
+            if (command.id==Settings) AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+            MENUITEMINFOW entry{}; entry.cbSize=sizeof(entry); entry.wID=command.id;
             entry.fMask=MIIM_ID|MIIM_FTYPE|MIIM_STRING|MIIM_STATE;
-            entry.dwTypeData=const_cast<PWSTR>(names[i]);
-            entry.fState=enabled[i]?MFS_ENABLED:MFS_DISABLED;
+            entry.dwTypeData=const_cast<PWSTR>(command.name);
+            entry.fState=command.enabled?MFS_ENABLED:MFS_DISABLED;
             if (bg) {
-                accessible[i]={MSAA_MENU_SIG,static_cast<DWORD>(wcslen(names[i])),entry.dwTypeData};
+                accessible[i]={MSAA_MENU_SIG,static_cast<DWORD>(wcslen(command.name)),entry.dwTypeData};
                 entry.fType=MFT_OWNERDRAW;
                 entry.fMask|=MIIM_DATA; entry.dwItemData=reinterpret_cast<ULONG_PTR>(&accessible[i]);
             }
@@ -1264,8 +1268,20 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             if (msg==WM_MEASUREITEM && lp) {
                 auto* item=reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
                 if (item->CtlType==ODT_MENU) {
-                    item->itemWidth=self->scale(188);
-                    item->itemHeight=self->scale(26);
+                    const auto* label=reinterpret_cast<const MSAAMENUINFO*>(item->itemData);
+                    if (!label) return FALSE;
+                    SIZE size{};
+                    HDC dc=GetDC(w);
+                    if (!dc) return FALSE;
+                    HGDIOBJ old=SelectObject(dc,self->font ? self->font : GetStockObject(DEFAULT_GUI_FONT));
+                    GetTextExtentPoint32W(dc,label->pszWText,label->cchWText,&size);
+                    SelectObject(dc,old);
+                    ReleaseDC(w,dc);
+                    // USER32 appends space for its popup columns even on text-only
+                    // owner-drawn items. Count that space toward the row width.
+                    const int columns=2*GetSystemMetrics(SM_CXMENUSIZE);
+                    item->itemWidth=std::max(1,static_cast<int>(size.cx)+self->scale(16)-columns);
+                    item->itemHeight=std::max<int>(self->scale(26),size.cy+self->scale(6));
                     return TRUE;
                 }
             }
@@ -1276,7 +1292,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                     self->theme.paint(item->hwndItem,self->tabs,item->hDC,self->scale(96));
                     return TRUE;
                 }
-                if (item->CtlType==ODT_MENU) { self->theme.menuItem(*item,self->scale(96)); return TRUE; }
+                if (item->CtlType==ODT_MENU) { self->theme.menuItem(*item,self->scale(96),self->font); return TRUE; }
             }
             if (msg==WM_RBUTTONDOWN) return 0;
             if (msg==WM_CONTEXTMENU || msg==WM_RBUTTONUP) {

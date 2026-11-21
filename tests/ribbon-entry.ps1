@@ -47,7 +47,7 @@ public static class RibbonEntryTest {
             GetWindowThreadProcessId(w,out pid);
             IntPtr menu;
             if (pid!=owner || !IsWindowVisible(w) || SendMessageTimeout(w,0x1E1,IntPtr.Zero,IntPtr.Zero,2,300,out menu)==IntPtr.Zero) continue;
-            if (GetMenuItemID(menu,0)==200) return w;
+            if (GetMenuItemID(menu,0)==201 && GetMenuItemID(menu,1)==202 && GetMenuItemID(menu,3)==200) return w;
         }
         return IntPtr.Zero;
     }
@@ -307,9 +307,9 @@ function Test-TabActions {
         } | Out-Null
         [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
         Wait-For 'restored tab closed again' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
-        Pick-Action $root 3
+        Pick-Action $root 1
         Wait-For 'restored closed directory' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $child } | Out-Null
-        Pick-Action $tabs 2
+        Pick-Action $tabs 0
         $other=Wait-For 'independent copy' { $shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and $_.Document.Folder.Self.Path -eq $child } | Select-Object -First 1 }
         if ([RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Opening in a new window removed the original tab.' }
         $otherRoot=[IntPtr][long]$other.HWND
@@ -400,7 +400,7 @@ function Test-SettingsMenu {
             $strip=[RibbonEntryTest]::GetDlgItem($band,102)
             [RibbonEntryTest]::Context($strip)
             $popup = [IntPtr](Wait-For "settings context menu ($action)" { [RibbonEntryTest]::SettingsPopup($strip).ToInt64() })
-            [RibbonEntryTest]::Pick($popup,0)
+            [RibbonEntryTest]::Pick($popup,3)
             $popup = [IntPtr]::Zero
             $dialog = [IntPtr](Wait-For "standalone settings dialog ($action)" { [RibbonEntryTest]::SettingsDialog($button).ToInt64() })
             $selection = [Windows.Automation.SelectionItemPattern]::Pattern
