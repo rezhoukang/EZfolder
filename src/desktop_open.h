@@ -72,9 +72,10 @@ class FolderOpen final : public IExecuteCommand, public IObjectWithSelection, pu
             FAILED(item->GetAttributes(SFGAO_FOLDER|SFGAO_FILESYSTEM|SFGAO_LINK,&attrs)) ||
             attrs!=(SFGAO_FOLDER|SFGAO_FILESYSTEM)) return false;
         PWSTR raw=nullptr;
-        HWND target=merge::target(nullptr);
-        if (!target || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH,&raw))) return false;
+        if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH,&raw))) return false;
         std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> path(raw,CoTaskMemFree);
+        HWND target=merge::target(nullptr,false,path.get());
+        if (!target) return false;
         DWORD pid=0; GetWindowThreadProcessId(target,&pid);
         if (pid) AllowSetForegroundWindow(pid);
         return merge::sendPath(target,nullptr,merge::openPath(),path.get());

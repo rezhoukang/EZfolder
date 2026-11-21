@@ -86,6 +86,7 @@ inline bool hasView(HWND band) { return GetPropW(band,countProp) || GetPropW(ban
 constexpr wchar_t countSinceProp[] = L"EZFolder.TabCountSince";
 constexpr wchar_t primaryProp[] = L"EZFolder.Primary";
 inline UINT openPath() { static UINT id = RegisterWindowMessageW(L"EZFolder.OpenFolder.4"); return id; }
+inline UINT containsPath() { static UINT id = RegisterWindowMessageW(L"EZFolder.ContainsFolder.1"); return id; }
 inline UINT movePath() { static UINT id = RegisterWindowMessageW(L"EZFolder.MoveTab.4"); return id; }
 inline UINT openSettings() { static UINT id = RegisterWindowMessageW(L"EZFolder.Settings.4"); return id; }
 inline UINT storeTab() { static UINT id = RegisterWindowMessageW(L"EZFolder.StoreTab.3"); return id; }
@@ -106,7 +107,18 @@ inline bool live(HWND band) {
     return root && GetPropW(root, bandProp) == band && IsWindowVisible(band);
 }
 inline ULONG_PTR number(HWND w,const wchar_t* key) { return reinterpret_cast<ULONG_PTR>(GetPropW(w,key)); }
-struct Search { HWND source; HWND result; bool includeDisabled; bool markedOnly; };
+inline bool sendPath(HWND target,HWND source,UINT type,const wchar_t* path,UINT timeout=3000) {
+    COPYDATASTRUCT packet{type,static_cast<DWORD>((wcslen(path)+1)*sizeof(wchar_t)),const_cast<wchar_t*>(path)};
+    DWORD_PTR result=0;
+    return SendMessageTimeoutW(target,WM_COPYDATA,reinterpret_cast<WPARAM>(source),reinterpret_cast<LPARAM>(&packet),
+        SMTO_ABORTIFHUNG|SMTO_BLOCK,timeout,&result) && result==1;
+}
+struct Search {
+    HWND source, result;
+    bool includeDisabled, markedOnly;
+    LPCWSTR path=nullptr;
+    PCIDLIST_ABSOLUTE folder=nullptr;
+};
 inline BOOL CALLBACK olderWindow(HWND root, LPARAM data) {
     auto& s = *reinterpret_cast<Search*>(data);
     HWND candidate = static_cast<HWND>(GetPropW(root, bandProp));
@@ -115,7 +127,7 @@ inline BOOL CALLBACK olderWindow(HWND root, LPARAM data) {
         if (!GetPropW(candidate,primaryProp)) return TRUE;
         s.result=candidate; return FALSE;
     }
-    if (GetPropW(candidate,fullProp) || (!s.includeDisabled && !IsWindowEnabled(root))) return TRUE;
+    if (!s.includeDisabled && !IsWindowEnabled(root)) return TRUE;
     DWORD cloaked = 0;
     if (SUCCEEDED(DwmGetWindowAttribute(root, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
     auto birth = reinterpret_cast<ULONG_PTR>(GetPropW(candidate, birthProp));
@@ -126,12 +138,20 @@ inline BOOL CALLBACK olderWindow(HWND root, LPARAM data) {
         return std::make_tuple(!GetPropW(w,startingProp),!!GetPropW(w,primaryProp),number(w,countProp),
             ~number(w,countSinceProp),~number(w,birthProp),~reinterpret_cast<UINT_PTR>(w));
     };
-    if (!s.result || rank(candidate)>rank(s.result))
-        s.result = candidate;
+    if (s.result && rank(candidate)<=rank(s.result)) return TRUE;
+    if (GetPropW(candidate,fullProp)) {
+        PWSTR name=nullptr;
+        if (!s.path && s.folder) SHGetNameFromIDList(s.folder,SIGDN_DESKTOPABSOLUTEPARSING,&name);
+        LPCWSTR path=s.path ? s.path : name;
+        bool fits=path && sendPath(candidate,s.source,containsPath(),path,150);
+        CoTaskMemFree(name);
+        if (!fits) return TRUE;
+    }
+    s.result = candidate;
     return TRUE;
 }
-inline HWND target(HWND source, bool includeDisabled = false) {
-    Search search{source, nullptr, includeDisabled,false};
+inline HWND target(HWND source, bool includeDisabled = false,LPCWSTR path=nullptr,PCIDLIST_ABSOLUTE folder=nullptr) {
+    Search search{source, nullptr, includeDisabled,false,path,folder};
     EnumWindows(olderWindow, reinterpret_cast<LPARAM>(&search));
     return search.result;
 }
@@ -139,12 +159,6 @@ inline void markReceiver(HWND bar) {
     Search search{nullptr,nullptr,true,true};
     EnumWindows(olderWindow,reinterpret_cast<LPARAM>(&search));
     if (!search.result && bar==target(nullptr)) SetPropW(bar,primaryProp,reinterpret_cast<HANDLE>(1));
-}
-inline bool sendPath(HWND target,HWND source,UINT type,const wchar_t* path) {
-    COPYDATASTRUCT packet{type,static_cast<DWORD>((wcslen(path)+1)*sizeof(wchar_t)),const_cast<wchar_t*>(path)};
-    DWORD_PTR result=0;
-    return SendMessageTimeoutW(target,WM_COPYDATA,reinterpret_cast<WPARAM>(source),reinterpret_cast<LPARAM>(&packet),
-        SMTO_ABORTIFHUNG|SMTO_BLOCK,3000,&result) && result==1;
 }
 inline Location folderOf(HWND band) {
     HWND root = frame(band);

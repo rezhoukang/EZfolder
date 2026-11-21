@@ -49,7 +49,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     BandTheme theme;
     ULONGLONG nextThemeCheck = 0;
     UINT timerPeriod = 0;
-    std::vector<Location> folders;
+    struct Tab { Location folder; std::wstring title; };
+    std::vector<Tab> folders;
     int active = -1, destination = -1;
     // The native view can own a location without any corresponding tab item.
     Location nativeLocation, closingTo;
@@ -117,7 +118,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     // needs a shell view. Keep the older navigation handshake for older peers.
     bool canStore(HWND source, LPARAM birth) const {
         return settled && !closingMergedFrame && !closingTo && (active >= 0 || nativeLocation) && !incoming && separating < 0 &&
-            IsWindowEnabled(merge::frame(bar)) && hasRoom() && validOffer(source,birth);
+            IsWindowEnabled(merge::frame(bar)) && validOffer(source,birth);
     }
     bool matchesOffer(HWND host, const COPYDATASTRUCT& packet) {
         if (!offered || settled || !offeredName || packet.dwData != merge::verifyName() ||
@@ -146,14 +147,16 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
         if (!canStore(source,birth)) return false;
         merge::markReceiver(bar);
-        int index = append(std::move(id),false);
+        bool added=false;
+        int index = tabForOpen(id,&added);
         if (index < 0) return false;
-        merge::LocalOffer::confirm(source,bar,birth,folders[index].get());
+        merge::LocalOffer::confirm(source,bar,birth,id ? id.get() : folders[index].folder.get());
         if (!PostMessageW(source,merge::storedTab(),reinterpret_cast<WPARAM>(bar),birth)) {
-            erase(index);
+            if (added) erase(index);
             controls();
             return false;
         }
+        index=moveTabToEnd(index);
         auto now = GetTickCount64();
         MergeVisibility::stored(bar,now);
         HWND foreground = GetForegroundWindow();
@@ -167,7 +170,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         bool single = nextImported < 0 && !MergeVisibility::pending(bar,merge::frame(source));
         if (nextImported < 0) firstImportedAt = now;
         nextImported = index;
-        showLoading(index);
+        if (index!=active || destination>=0) showLoading(index);
         activateAfter = single ? now : now+120;
         schedule(25);
         if (single && destination < 0 && (!awaitingAck || GetPropW(awaitingAck,merge::offerProp) != bar))
@@ -177,7 +180,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     void endImport(bool success) {
         if (!incoming) return;
         if (success && validOffer(incoming, incomingBirth)) {
-            merge::LocalOffer::confirm(incoming, bar, incomingBirth, folders[active].get());
+            merge::LocalOffer::confirm(incoming, bar, incomingBirth, folders[active].folder.get());
             if (PostMessageW(incoming, merge::received(), reinterpret_cast<WPARAM>(bar), incomingBirth))
                 awaitingAck = incoming;
         }
@@ -186,7 +189,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         importIndex = -1;
     }
     LRESULT reserve(HWND source, LPARAM birth) {
-        if (!settled || storing || (active < 0 && !nativeLocation) || destination >= 0 || incoming || !hasRoom() ||
+        if (!settled || storing || (active < 0 && !nativeLocation) || destination >= 0 || incoming ||
             (awaitingAck && GetPropW(awaitingAck, merge::offerProp) == bar) || separating >= 0 ||
             !validOffer(source, birth)) return 0;
         incoming = source;
@@ -199,7 +202,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!source) return;
         Location id = merge::LocalOffer::read(source, bar, incomingBirth);
         if (!id) id = merge::folderOf(source);
-        if (!validOffer(source, incomingBirth) || !hasRoom()) {
+        if (!validOffer(source, incomingBirth)) {
             if (validOffer(source,incomingBirth)) PostMessageW(source,merge::retry(),reinterpret_cast<WPARAM>(bar),incomingBirth);
             endImport(false);
             return;
@@ -210,9 +213,15 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             endImport(false);
             return;
         }
-        importIndex = append(std::move(id), false);
-        if (importIndex < 0) { endImport(false); return; }
-        select(importIndex);
+        bool added=false;
+        int index=tabForOpen(id,&added);
+        if (index>=0) index=moveTabToEnd(index);
+        importIndex=added ? index : -1;
+        if (index<0) {
+            PostMessageW(source,merge::retry(),reinterpret_cast<WPARAM>(bar),incomingBirth);
+            endImport(false);
+        } else if (index==active) endImport(true);
+        else select(index);
     }
     void settle() {
         if (!closingMergedFrame) presentation.finish();
@@ -239,7 +248,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (settled) return;
         if (GetPropW(merge::frame(bar), merge::keepFrame) || folders.size() > 1 || GetTickCount64() - opened > 20000) { settle(); return; }
         if (offered || active < 0 || !merge::live(bar)) return;
-        HWND host = merge::target(bar);
+        HWND host = merge::target(bar,false,nullptr,folders[active].folder.get());
         if (!host) {
             // Explorer briefly disables frames while it is creating a sibling.
             if (HWND candidate = merge::target(bar,true)) presentation.begin(merge::frame(bar),candidate);
@@ -248,8 +257,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
         presentation.begin(merge::frame(bar),host);
         if (GetPropW(host,merge::startingProp)) return;
-        if (!offeredFolder || !ILIsEqual(offeredFolder.get(), folders[active].get())) {
-            offeredFolder.reset(ILCloneFull(folders[active].get()));
+        if (!offeredFolder || !ILIsEqual(offeredFolder.get(), folders[active].folder.get())) {
+            offeredFolder.reset(ILCloneFull(folders[active].folder.get()));
             return;
         }
         if (hasSelection()) { settle(); return; }
@@ -379,17 +388,48 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         }
         return Location(id);
     }
-    bool label(int i, bool insert) {
-        if (i == hoverIndex) hideTitle();
-        PWSTR name = nullptr;
-        SHGetNameFromIDList(folders[i].get(), SIGDN_NORMALDISPLAY, &name);
+    bool writeTitle(int i, bool insert=false) {
         TCITEMW item{};
         item.mask = TCIF_TEXT;
-        item.pszText = name && *name ? name : const_cast<wchar_t*>(L"文件夹");
-        bool ok = insert ? TabCtrl_InsertItem(tabs, i, &item) >= 0
-                         : TabCtrl_SetItem(tabs, i, &item) != FALSE;
-        CoTaskMemFree(name);
-        return ok;
+        item.pszText = folders[i].title.data();
+        return insert ? TabCtrl_InsertItem(tabs,i,&item)>=0 : TabCtrl_SetItem(tabs,i,&item)!=FALSE;
+    }
+    bool label(int i, bool insert) {
+        if (i == hoverIndex) hideTitle();
+        PWSTR raw = nullptr;
+        SHGetNameFromIDList(folders[i].folder.get(), SIGDN_NORMALDISPLAY, &raw);
+        std::unique_ptr<wchar_t,decltype(&CoTaskMemFree)> name(raw,CoTaskMemFree);
+        folders[i].title = raw && *raw ? raw : L"文件夹";
+        return writeTitle(i,insert);
+    }
+    int matchingTab(PCIDLIST_ABSOLUTE id) const {
+        // Explicitly created tabs can already share a location. Prefer the active
+        // view, then the rightmost match, without disturbing the other copies.
+        if (active>=0 && !(closeAfterSwitch && destination>=0) && ILIsEqual(folders[active].folder.get(),id)) return active;
+        for (int i=static_cast<int>(folders.size())-1;i>=0;--i)
+            if (i!=active && ILIsEqual(folders[i].folder.get(),id)) return i;
+        return -1;
+    }
+    int moveTabToEnd(int index) {
+        int last=static_cast<int>(folders.size())-1;
+        if (index==last) return last;
+        hideTitle();
+        std::rotate(folders.begin()+index,folders.begin()+index+1,folders.end());
+        for (int* slot : {&active,&destination,&queuedTab,&nextImported,&pendingNew,&importIndex,&pressedTab,&theme.loading}) {
+            if (*slot==index) *slot=last;
+            else if (*slot>index) --*slot;
+        }
+        for (int i=index;i<=last;++i) writeTitle(i);
+        controls();
+        return last;
+    }
+    int tabForOpen(Location& id,bool* added=nullptr) {
+        // Explorer can navigate inside the active tab between timer ticks.
+        sync();
+        int match=matchingTab(id.get());
+        if (added) *added=match<0;
+        if (match>=0) return match;
+        return hasRoom() ? append(std::move(id),false) : -1;
     }
     void controls() {
         if (!tabs || !add) return;
@@ -403,7 +443,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     int append(Location location, bool activate = true) {
         if (!location) return -1;
         int index = static_cast<int>(folders.size());
-        folders.push_back(std::move(location));
+        folders.push_back({std::move(location),{}});
         // Reserve space before the native control decides whether to show its overflow buttons.
         layout();
         if (!label(index, true)) { folders.pop_back(); layout(); return -1; }
@@ -421,7 +461,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (active > index) --active;
     }
     void remember(int index) {
-        Location snapshot(ILCloneFull(folders[index].get()));
+        Location snapshot(ILCloneFull(folders[index].folder.get()));
         if (!snapshot) return;
         closed.push_back(std::move(snapshot));
         if (closed.size()>10) closed.erase(closed.begin());
@@ -462,7 +502,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             HWND root=merge::frame(bar);
             if (IsIconic(root)) ShowWindow(root,SW_RESTORE);
             if (GetForegroundWindow()!=root) SetForegroundWindow(root);
-            showLoading(queuedTab);
+            if (queuedTab!=active || destination>=0) showLoading(queuedTab);
             PostMessageW(bar,navigateMessage,0,0);
             return;
         }
@@ -473,7 +513,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (destination<0 && nextImported<0 && queuedTab<0) clearLoading();
     }
     bool acceptPath(HWND source,const COPYDATASTRUCT& packet) {
-        if (!merge::live(bar) || !settled || closingMergedFrame || !hasRoom() || separating>=0 ||
+        if (!merge::live(bar) || !settled || closingMergedFrame || separating>=0 ||
             incoming || storing || closingTo || (active<0 && !nativeLocation) || !IsWindowEnabled(merge::frame(bar))) return false;
         bool move=packet.dwData==merge::movePath();
         if (move && (!merge::live(source) || source==bar || GetPropW(source,merge::offerProp)!=bar)) return false;
@@ -482,15 +522,19 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         size_t length=packet.cbData/sizeof(wchar_t)-1;
         if (path[length] || wmemchr(path,0,length)) return false;
         bool disk=(length>=3 && path[1]==L':' && path[2]==L'\\') || !wcsncmp(path,L"\\\\",2);
-        if (!disk && !(move && !wcsncmp(path,L"::{",3))) return false;
+        bool query=packet.dwData==merge::containsPath();
+        if (!disk && !((move || query) && !wcsncmp(path,L"::{",3))) return false;
         PIDLIST_ABSOLUTE parsed=nullptr;
         SFGAOF attrs=SFGAO_FOLDER;
         if (FAILED(SHParseDisplayName(path,nullptr,&parsed,SFGAO_FOLDER,&attrs))) return false;
         Location id(parsed);
-        if (!(attrs&SFGAO_FOLDER) || !bar || !hasRoom() || separating>=0 || incoming || closingTo) return false;
+        if (!(attrs&SFGAO_FOLDER) || !bar || separating>=0 || incoming || closingTo) return false;
+        if (query) { sync(); return matchingTab(id.get())>=0; }
         if (!move) merge::markReceiver(bar);
-        int index=append(std::move(id),false);
+        if (move && !hasRoom()) return false;
+        int index=move ? append(std::move(id),false) : tabForOpen(id);
         if (index<0) return false;
+        index=moveTabToEnd(index);
         queuedTab=index;
         nextImported=-1;
         presentQueued=true;
@@ -544,7 +588,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!tabs) return;
         Location actual = current();
         if (destination >= 0) {
-            if (actual && ILIsEqual(actual.get(), closingTo ? closingTo.get() : folders[destination].get())) {
+            if (actual && ILIsEqual(actual.get(), closingTo ? closingTo.get() : folders[destination].folder.get())) {
                 completeSwitch();
                 return;
             }
@@ -563,9 +607,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (nativeLocation) {
             if (!ILIsEqual(actual.get(),nativeLocation.get())) setNativeLocation(std::move(actual));
         } else if (active < 0) append(std::move(actual));
-        else if (!ILIsEqual(actual.get(), folders[active].get())) {
+        else if (!ILIsEqual(actual.get(), folders[active].folder.get())) {
             nextImported = -1;
-            folders[active] = std::move(actual);
+            folders[active].folder = std::move(actual);
             label(active, false);
         }
     }
@@ -579,8 +623,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         closeAfterSwitch = removePrevious;
         rememberRemoval = saveClosed;
         deadline = GetTickCount64() + 15000;
-        auto from=active>=0 ? folders[active].get() : nativeLocation.get();
-        auto to=closingTo ? closingTo.get() : folders[index].get();
+        auto from=active>=0 ? folders[active].folder.get() : nativeLocation.get();
+        auto to=closingTo ? closingTo.get() : folders[index].folder.get();
         Location target(ILCloneFull(to));
         if (ILIsEqual(from,to)) {
             if (!incoming) { completeSwitch(); return; }
@@ -646,7 +690,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         separating = -1;
         independent = nullptr;
         bool original = index < static_cast<int>(folders.size()) &&
-            ILIsEqual(folders[index].get(),separationFolder.get());
+            ILIsEqual(folders[index].folder.get(),separationFolder.get());
         separationFolder.reset();
         if (landed && original && !copyToWindow) closeTab(index,false);
         else if (!landed) MessageBeep(MB_ICONWARNING);
@@ -664,7 +708,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             return;
         }
         // Reserve this exact, initially hidden Explorer instance before it can offer a tab.
-        separationFolder.reset(ILCloneFull(folders[index].get()));
+        separationFolder.reset(ILCloneFull(folders[index].folder.get()));
         if (!separationFolder) return;
         separating = index;
         separationPoint = drop;
@@ -735,7 +779,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         int index=keyboard ? active : TabCtrl_HitTest(tabs,&hit);
         if (index<0) index=active;
         bool idle=destination<0 && separating<0 && !incoming && queuedTab<0 && !storing;
-        Location clicked(index>=0 ? ILCloneFull(folders[index].get()) : nullptr);
+        Location clicked(index>=0 ? ILCloneFull(folders[index].folder.get()) : nullptr);
         HMENU menu=CreatePopupMenu();
         if (!menu) return;
         const wchar_t* names[]={L"设置",L"在新窗口打开此标签页",L"恢复上个关闭的标签页"};
@@ -769,7 +813,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             return;
         }
         if (destination>=0 || separating>=0 || incoming || queuedTab>=0) return;
-        if (choice==NewWindow && index>=0 && index<static_cast<int>(folders.size()) && clicked && ILIsEqual(clicked.get(),folders[index].get())) {
+        if (choice==NewWindow && index>=0 && index<static_cast<int>(folders.size()) && clicked && ILIsEqual(clicked.get(),folders[index].folder.get())) {
             RECT r{}; GetWindowRect(merge::frame(bar),&r);
             separate(index,{r.left+scale(96),r.top+scale(80)},true);
         } else if (choice==Restore) {
@@ -866,14 +910,14 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (!acceptsDrop(other) || destination>=0 || separating>=0 || index<0 || index>=static_cast<int>(folders.size())) return;
         sync();
         PWSTR path=nullptr;
-        Location original(ILCloneFull(folders[index].get()));
+        Location original(ILCloneFull(folders[index].folder.get()));
         if (!original || FAILED(SHGetNameFromIDList(original.get(),SIGDN_DESKTOPABSOLUTEPARSING,&path))) return;
         separating=index;
         bool ok=SetPropW(bar,merge::offerProp,other) && merge::sendPath(other,bar,merge::movePath(),path);
         CoTaskMemFree(path);
         RemovePropW(bar,merge::offerProp);
         separating=-1;
-        if (!ok || index>=static_cast<int>(folders.size()) || !ILIsEqual(original.get(),folders[index].get())) return;
+        if (!ok || index>=static_cast<int>(folders.size()) || !ILIsEqual(original.get(),folders[index].folder.get())) return;
         if (folders.size()==1) PostMessageW(merge::frame(bar),WM_CLOSE,0,0);
         else closeTab(index,false);
     }
@@ -955,7 +999,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         RECT r{};
         if (!TabCtrl_GetItemRect(tabs,i,&r)) return;
         PWSTR name = nullptr;
-        if (FAILED(SHGetNameFromIDList(folders[i].get(),SIGDN_NORMALDISPLAY,&name)) || !name) return;
+        if (FAILED(SHGetNameFromIDList(folders[i].folder.get(),SIGDN_NORMALDISPLAY,&name)) || !name) return;
         tipTitle.reset(name);
         RECT label = BandTheme::labelRect(r,scale(96),true);
         HDC dc = GetDC(tabs);
@@ -1154,7 +1198,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             }
             if (msg == WM_COPYDATA && lp) {
                 auto& packet=*reinterpret_cast<COPYDATASTRUCT*>(lp);
-                if (packet.dwData==merge::openPath() || packet.dwData==merge::movePath()) {
+                if (packet.dwData==merge::openPath() || packet.dwData==merge::movePath() || packet.dwData==merge::containsPath()) {
                     Com<IDeskBand> guard; self->AddRef(); guard.p=self;
                     return self->acceptPath(reinterpret_cast<HWND>(wp),packet);
                 }
@@ -1307,7 +1351,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         attachMenus();
         controls();
         sync();
-        if (!settled && active >= 0) offeredFolder.reset(ILCloneFull(folders[active].get()));
+        if (!settled && active >= 0) offeredFolder.reset(ILCloneFull(folders[active].folder.get()));
         layout();
         return schedule(settled ? 500 : 25) ? S_OK : E_FAIL;
     }

@@ -272,6 +272,10 @@ function Test-TabActions {
                 Wait-For 'additional tab' { [RibbonEntryTest]::TabCount($otherTabs) -eq $n+1 } | Out-Null
             }
             if (![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64()) {throw 'Fixture did not reach capacity.'}
+            $fullCount=[RibbonEntryTest]::TabCount($otherTabs)
+            $existing=Join-Path $folder 'Primary'
+            $shell.Explore($existing)
+            Wait-For 'full primary reuses its own tab' { [RibbonEntryTest]::TabCount($otherTabs) -eq $fullCount -and $other.Document.Folder.Self.Path -eq $existing } | Out-Null
             Open-RoutedFolder 'Overflow' $window $tabs -Explore
             $other.Width=900
             Wait-For 'primary has room again' { ![FixtureWindow]::GetProp($otherBar,'EZFolder.Full').ToInt64() } | Out-Null
