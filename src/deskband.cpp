@@ -65,7 +65,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     bool closeAfterSwitch = false;
     bool rememberRemoval = false, restoring = false, copyToWindow = false, dragging = false;
     std::vector<Location> closed;
-    std::wstring dragText;
+    HWND dragPreview=nullptr;
+    POINT dragGrip{};
+    HCURSOR cursorBeforeDrag=nullptr,dragCursor=nullptr;
     HWND statusBar = nullptr, statusHost = nullptr, loadingCover = nullptr, bandParent = nullptr;
     ULONGLONG loadingSince = 0;
     int pendingNew = -1;
@@ -487,6 +489,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         return index;
     }
     void erase(int index) {
+        if (pressedTab==index) tabMouse(tabs,WM_CANCELMODE,0,0);
+        else if (pressedTab>index) --pressedTab;
         if (index == nextImported) nextImported = -1;
         else if (index < nextImported) --nextImported;
         if (index == queuedTab) queuedTab=-1;
@@ -959,21 +963,30 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     }
     void dragFeedback(POINT p) {
         if (pressedTab<0 || pressedTab>=static_cast<int>(folders.size())) return;
-        HWND other=dropBand(p);
-        const auto& hint=folders[pressedTab].title;
-        if (!dragging || dragText!=hint) {
-            dragText=hint;
-            tipTool.lpszText=dragText.data();
-            SendMessageW(tooltip,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&tipTool));
+        if (!dragging) {
+            hideTitle();
+            cursorBeforeDrag=GetCursor();
+            dragging=true;
+            dragPreview=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,
+                L"STATIC",folders[pressedTab].title.c_str(),WS_POPUP,0,0,0,0,bar,nullptr,module,nullptr);
+            if (dragPreview) {
+                if (theme.renderDrag(dragPreview,tabs,pressedTab,scale(96),p,pressPoint,dragGrip))
+                    ShowWindow(dragPreview,SW_SHOWNOACTIVATE);
+                else { DestroyWindow(dragPreview); dragPreview=nullptr; }
+            }
+        } else if (dragPreview) {
+            SetWindowPos(dragPreview,nullptr,p.x-dragGrip.x,p.y-dragGrip.y,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOZORDER);
         }
-        SendMessageW(tooltip,TTM_TRACKPOSITION,0,MAKELPARAM(p.x+scale(16),p.y+scale(20)));
-        if (!dragging) SendMessageW(tooltip,TTM_TRACKACTIVATE,TRUE,reinterpret_cast<LPARAM>(&tipTool));
-        dragging=true;
-        SetCursor(LoadCursorW(nullptr,other && !acceptsDrop(other)?IDC_NO:IDC_SIZEALL));
+        HWND other=dropBand(p);
+        dragCursor=other && !acceptsDrop(other) ? LoadCursorW(nullptr,IDC_NO) :
+            dragPreview ? nullptr : LoadCursorW(nullptr,IDC_SIZEALL);
+        SetCursor(dragCursor);
     }
     void endDrag() {
-        if (dragging && tooltip) SendMessageW(tooltip,TTM_TRACKACTIVATE,FALSE,reinterpret_cast<LPARAM>(&tipTool));
+        if (!dragging) return;
         dragging=false;
+        if (dragPreview) { DestroyWindow(dragPreview); dragPreview=nullptr; }
+        SetCursor(cursorBeforeDrag);
     }
     void moveTo(int index,HWND other) {
         if (!acceptsDrop(other) || destination>=0 || separating>=0 || index<0 || index>=static_cast<int>(folders.size())) return;
@@ -993,7 +1006,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     }
     bool tabMouse(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE || (msg == WM_KEYDOWN && wp == VK_ESCAPE)) {
-            if (pressedTab < 0) return false;
+            if (pressedTab < 0 && !dragging) return false;
             pressedTab = -1;
             endDrag();
             if (GetCapture() == w) ReleaseCapture();
@@ -1492,6 +1505,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 self->tabMenu(p); return 0;
             }
             if (msg == WM_ERASEBKGND) return 1;
+            if (msg==WM_SETCURSOR && self->dragging && w==self->tabs) { SetCursor(self->dragCursor); return TRUE; }
             if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
                 PAINTSTRUCT ps{};
                 HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : reinterpret_cast<HDC>(wp);
@@ -1817,7 +1831,10 @@ public:
     STDMETHODIMP ContextSensitiveHelp(BOOL) override { return E_NOTIMPL; }
     STDMETHODIMP ShowDW(BOOL show) override {
         if (bar) {
-            if (!show) { nativeCtrlDeadline=0; hideTitle(); if (!closingMergedFrame) presentation.finish(); }
+            if (!show) {
+                tabMouse(tabs,WM_CANCELMODE,0,0);
+                nativeCtrlDeadline=0; hideTitle(); if (!closingMergedFrame) presentation.finish();
+            }
             ShowWindow(bar, show ? SW_SHOWNA : SW_HIDE);
             if (show) PostMessageW(bar, refreshMessage, 0, 0);
         }

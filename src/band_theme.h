@@ -32,6 +32,17 @@ class BandTheme {
             return RGB(channel(GetBValue(fg),GetBValue(bg)),channel(GetGValue(fg),GetGValue(bg)),
                        channel(GetRValue(fg),GetRValue(bg)));
         }
+        static int cornerCoverage(int x,int y,int curve) {
+            int coverage=0;
+            for (int sy=0;sy<8;++sy) {
+                int dy=std::max(0,curve*8-(16*y+2*sy+1));
+                for (int sx=0;sx<8;++sx) {
+                    int dx=std::max(0,curve*8-(16*x+2*sx+1));
+                    coverage+=dx*dx+dy*dy<=curve*curve*64;
+                }
+            }
+            return coverage;
+        }
         void paint(HDC dc, const RECT& r, int curve, COLORREF fg, COLORREF bg) {
             // Match the footprint of the original penless GDI RoundRect.
             int width=r.right-r.left-1, height=r.bottom-r.top-1;
@@ -47,20 +58,14 @@ class BandTheme {
                 diameter=curve;
                 inside=fg;
                 outside=bg;
-                pixels.assign(size_t(width)*height,blend(fg,bg,64));
+                // GDI ignores the high byte of BI_RGB. Keep corner coverage there
+                // so the drag image can use the same edges over any background.
+                pixels.assign(size_t(width)*height,(64u<<24)|blend(fg,bg,64));
                 // Sample one quadrant on an 8x8 grid and mirror it to all four corners.
-                const int radius=curve*8;
                 for (int y=0;y<(curve+1)/2;++y) {
                     for (int x=0;x<(curve+1)/2;++x) {
-                        int coverage=0;
-                        for (int sy=0;sy<8;++sy) {
-                            int dy=std::max(0,radius-(16*y+2*sy+1));
-                            for (int sx=0;sx<8;++sx) {
-                                int dx=std::max(0,radius-(16*x+2*sx+1));
-                                coverage+=dx*dx+dy*dy<=radius*radius;
-                            }
-                        }
-                        DWORD color=blend(fg,bg,coverage);
+                        int coverage=cornerCoverage(x,y,curve);
+                        DWORD color=(DWORD(coverage)<<24)|blend(fg,bg,coverage);
                         int right=width-1-x, bottom=height-1-y;
                         pixels[y*width+x]=pixels[y*width+right]=color;
                         pixels[bottom*width+x]=pixels[bottom*width+right]=color;
@@ -77,13 +82,13 @@ class BandTheme {
         MoveToEx(dc,x,y,nullptr);
         LineTo(dc,x2,y2);
     }
-    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, RECT dirty, int dpi) {
+    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, RECT dirty, int dpi,int lifted=-1) {
         auto px = [dpi](int n) { return MulDiv(n,dpi,96); };
         fill(dc,dirty,background);
         SetBkMode(dc,TRANSPARENT);
         HFONT font = reinterpret_cast<HFONT>(SendMessageW(w,WM_GETFONT,0,0));
         if (font) SelectObject(dc,font);
-        bool focus = GetFocus() == w && !(SendMessageW(w,WM_QUERYUISTATE,0,0) & UISF_HIDEFOCUS);
+        bool focus = lifted<0 && GetFocus() == w && !(SendMessageW(w,WM_QUERYUISTATE,0,0) & UISF_HIDEFOCUS);
         if (w != tabs) {
             RECT r = bounds;
             InflateRect(&r,-px(3),-px(3));
@@ -102,7 +107,8 @@ class BandTheme {
         int selected = TabCtrl_GetCurSel(tabs), count = TabCtrl_GetItemCount(tabs);
         int first=0, end=count;
         RECT hotItem{};
-        if (hotWindow==tabs && hotTab>=0 && TabCtrl_GetItemRect(tabs,hotTab,&hotItem) &&
+        if (lifted>=0) { first=lifted; end=lifted+1; }
+        else if (hotWindow==tabs && hotTab>=0 && TabCtrl_GetItemRect(tabs,hotTab,&hotItem) &&
             dirty.left>=hotItem.left && dirty.right<=hotItem.right) {
             first=hotTab;
             end=hotTab+1;
@@ -110,7 +116,7 @@ class BandTheme {
         for (int i=first; i<end; ++i) {
             RECT r{};
             if (!TabCtrl_GetItemRect(tabs,i,&r) || r.right <= dirty.left || r.left >= dirty.right) continue;
-            bool active = i == selected, hot = w == hotWindow && i == hotTab;
+            bool active = i == selected || i==lifted, hot = i==lifted || (w == hotWindow && i == hotTab);
             RECT close = closeRect(r,dpi,hot);
             r.top = px(2);
             r.bottom = bounds.bottom - px(1);
@@ -147,7 +153,7 @@ class BandTheme {
             DrawTextW(dc,title,-1,&label,flags);
             if (!IsRectEmpty(&close)) {
                 int x = (close.left+close.right)/2, y = (r.top+r.bottom)/2, arm = px(3);
-                if (hot && PtInRect(&close,hotPoint)) {
+                if (lifted<0 && hot && PtInRect(&close,hotPoint)) {
                     int radius=std::min({px(8),int(close.right-close.left-2)/2,int(r.bottom-r.top-2)/2});
                     if (radius>0) {
                         RECT tile{x-radius,y-radius,x+radius+2,y+radius+2};
@@ -162,6 +168,45 @@ class BandTheme {
         }
     }
 public:
+    bool renderDrag(HWND popup,HWND tabs,int index,int dpi,POINT pointer,POINT press,POINT& grip) {
+        RECT strip{},r{};
+        if (!GetClientRect(tabs,&strip) || !TabCtrl_GetItemRect(tabs,index,&r)) return false;
+        r.top=MulDiv(2,dpi,96);
+        r.bottom=strip.bottom-MulDiv(1,dpi,96)-1;
+        --r.right;
+        SIZE size{r.right-r.left,r.bottom-r.top};
+        if (size.cx<1 || size.cy<1) return false;
+        grip={press.x-r.left,press.y-r.top};
+        POINT at{pointer.x-grip.x,pointer.y-grip.y},origin{};
+        BITMAPINFO info{};
+        info.bmiHeader={sizeof(BITMAPINFOHEADER),size.cx,-size.cy,1,32,BI_RGB,0,0,0,0,0};
+        HDC dc=CreateCompatibleDC(nullptr);
+        if (!dc) return false;
+        void* bits=nullptr;
+        HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+        bool ready=false;
+        if (bitmap) {
+            auto old=SelectObject(dc,bitmap);
+            SetViewportOrgEx(dc,-r.left,-r.top,nullptr);
+            try {
+                draw(tabs,tabs,dc,strip,r,dpi,index);
+                SetViewportOrgEx(dc,0,0,nullptr);
+                GdiFlush();
+                auto pixels=static_cast<DWORD*>(bits);
+                for (LONG i=0;i<size.cx*size.cy;++i) {
+                    int coverage=selectedSurface.pixels[i]>>24;
+                    if (coverage==64) pixels[i]|=0xff000000u;
+                    else pixels[i]=TabSurface::blend(surface,0,coverage) | (DWORD((255*coverage+32)/64)<<24);
+                }
+                BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+                ready=UpdateLayeredWindow(popup,nullptr,&at,&size,dc,&origin,0,&blend,ULW_ALPHA)!=FALSE;
+            } catch (const std::bad_alloc&) { /* Keep the ordinary drag cursor if allocation fails. */ }
+            SelectObject(dc,old);
+            DeleteObject(bitmap);
+        }
+        DeleteDC(dc);
+        return ready;
+    }
     int loading=-1;
     bool darkMenu() const { return background==RGB(0,0,0) && surface==RGB(48,48,48); }
     void menuItem(const DRAWITEMSTRUCT& item,int dpi,HFONT font) const {

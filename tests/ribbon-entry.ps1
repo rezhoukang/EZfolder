@@ -225,15 +225,13 @@ public static class RibbonEntryTest {
         if(SendMessageTimeout(w,message,(IntPtr)(message==0x201||message==0x200?1:0),(IntPtr)((y<<16)|(x&65535)),2,6000,out result)==IntPtr.Zero)
             throw new Exception("Test window did not respond to mouse input");
     }
-    public static bool DragTip(IntPtr bar,string expected) {
+    public static IntPtr DragPreview(IntPtr bar,string expected) {
         uint owner,pid; GetWindowThreadProcessId(bar,out owner);
-        for(IntPtr w=FindWindowEx(IntPtr.Zero,IntPtr.Zero,"tooltips_class32",null);w!=IntPtr.Zero;w=FindWindowEx(IntPtr.Zero,w,"tooltips_class32",null)) {
+        for(IntPtr w=FindWindowEx(IntPtr.Zero,IntPtr.Zero,"Static",expected);w!=IntPtr.Zero;w=FindWindowEx(IntPtr.Zero,w,"Static",expected)) {
             GetWindowThreadProcessId(w,out pid);
-            if(pid!=owner||!IsWindowVisible(w))continue;
-            var text=new StringBuilder(128);IntPtr result;
-            if(ReadText(w,13,(IntPtr)128,text,2,300,out result)!=IntPtr.Zero && text.ToString()==expected)return true;
+            if(pid==owner && IsWindowVisible(w)) return w;
         }
-        return false;
+        return IntPtr.Zero;
     }
     public static void Click(IntPtr button){
         IntPtr result;
@@ -485,7 +483,18 @@ function Test-TabActions {
         $x=$to.Left+15-$from.Left; $y=$to.Top+8-$from.Top
         [RibbonEntryTest]::Mouse($tabs,0x201,12,8)
         [RibbonEntryTest]::Mouse($tabs,0x200,$x,$y)
-        Wait-For 'drag feedback shows only the tab name' { [RibbonEntryTest]::DragTip($bar,[IO.Path]::GetFileName($folder)) } | Out-Null
+        $title=[IO.Path]::GetFileName($folder)
+        $preview=[IntPtr](Wait-For 'drag preview with the tab name' { [RibbonEntryTest]::DragPreview($bar,$title).ToInt64() })
+        $pos=[RibbonEntryTest]::Bounds($preview)
+        $px=$from.Left+$x; $py=$from.Top+$y
+        if ($pos.Left -gt $px -or $pos.Right -le $px -or $pos.Top -gt $py -or $pos.Bottom -le $py) { throw 'Preview missed the grab point.' }
+        [RibbonEntryTest]::Mouse($tabs,0x200,($x+23),($y+7))
+        $moved=[RibbonEntryTest]::Bounds($preview)
+        if ($moved.Left-$pos.Left -ne 23 -or $moved.Top-$pos.Top -ne 7) { throw 'Drag preview did not follow the grab point.' }
+        [RibbonEntryTest]::DeliverKey($tabs,27)
+        if ([RibbonEntryTest]::IsWindowVisible($preview) -or [RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Escape failed to cancel the drag.' }
+        [RibbonEntryTest]::Mouse($tabs,0x201,12,8)
+        [RibbonEntryTest]::Mouse($tabs,0x200,$x,$y)
         [RibbonEntryTest]::Mouse($tabs,0x202,$x,$y)
         Start-Sleep -Milliseconds 250
         Wait-For 'explicit drop moves only the dragged folder' {
