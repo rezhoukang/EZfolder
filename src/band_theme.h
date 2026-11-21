@@ -32,8 +32,12 @@ class BandTheme {
         if (w != tabs) {
             RECT r = bounds;
             InflateRect(&r,-px(3),-px(3));
+            // GDI's penless RoundRect paints through right-2 and bottom-2.
+            // Give its painted bounds an odd pixel count to match the plus.
+            r.right += (r.right-r.left) & 1;
+            r.bottom += (r.bottom-r.top) & 1;
             if (hotWindow == w) rounded(dc,r,hover,px(8));
-            int x = bounds.right/2, y = bounds.bottom/2, arm = px(6);
+            int x = (r.left+r.right-2)/2, y = (r.top+r.bottom-2)/2, arm = px(6);
             COLORREF ink = IsWindowEnabled(w) ? text : edge;
             line(dc,x-arm,y,x+arm+1,y,ink);
             line(dc,x,y-arm,x,y+arm+1,ink);
