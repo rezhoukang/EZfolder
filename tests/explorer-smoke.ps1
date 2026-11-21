@@ -1,5 +1,5 @@
 ﻿# Run with 64-bit Windows PowerShell after installing the band.
-param([switch]$RequireAlreadyVisible,[switch]$SeparateProcess,[switch]$MeasurePresentation,[switch]$TestDensity)
+param([switch]$RequireAlreadyVisible,[switch]$SeparateProcess,[switch]$MeasurePresentation,[switch]$TestDensity,[switch]$TestPlusPaint)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'fixture-window.ps1')
 $id = '{5129B68D-A44B-427B-AEE1-53137D3989EA}'
@@ -65,10 +65,14 @@ public static class BandTest {
     [DllImport("user32")] public static extern bool SetCursorPos(int x,int y);
     [DllImport("user32")] public static extern bool SetForegroundWindow(IntPtr w);
     [DllImport("user32",CharSet=CharSet.Unicode)] static extern int RegisterWindowMessage(string name);
-    public static bool AcceptsOffer(IntPtr target,IntPtr source,IntPtr birth) {
+    [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)]
+    struct CopyData { public IntPtr type; public int bytes; [MarshalAs(UnmanagedType.LPWStr)] public string path; }
+    [DllImport("user32",EntryPoint="SendMessageTimeoutW")] static extern IntPtr SendPath(IntPtr w,int msg,IntPtr from,ref CopyData packet,int flags,int timeout,out IntPtr result);
+    public static bool AcceptsFolder(IntPtr target,string path) {
+        var packet=new CopyData {type=(IntPtr)RegisterWindowMessage("EZFolder.OpenFolder.4"),bytes=(path.Length+1)*2,path=path};
         IntPtr result;
-        if (SendMessageTimeout(target,RegisterWindowMessage("EZFolder.RequestTab.2"),source,birth,2,1000,out result)==IntPtr.Zero)
-            throw new Exception("Merge target did not respond.");
+        if (SendPath(target,0x4A,IntPtr.Zero,ref packet,2,3000,out result)==IntPtr.Zero)
+            throw new Exception("Folder receiver did not respond.");
         return result!=IntPtr.Zero;
     }
     [DllImport("user32")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
@@ -95,6 +99,41 @@ public static class BandTest {
         int point = (8 << 16) | x;
         Send(tabs,0x201,1,point);
         Send(tabs,0x202,0,point);
+    }
+    [DllImport("user32")] static extern bool PostMessage(IntPtr w,int msg,IntPtr wp,IntPtr lp);
+    [DllImport("user32")] static extern IntPtr GetDC(IntPtr w);
+    [DllImport("user32")] static extern int ReleaseDC(IntPtr w,IntPtr dc);
+    [DllImport("user32")] static extern IntPtr WindowFromPoint(Point p);
+    [DllImport("user32")] static extern bool SetWindowPos(IntPtr w,IntPtr after,int x,int y,int width,int height,uint flags);
+    public static void Topmost(IntPtr w,bool on) {
+        if (!SetWindowPos(w,new IntPtr(on ? -1 : -2),0,0,0,0,0x13)) throw new Exception("Fixture placement failed.");
+    }
+    [DllImport("gdi32")] static extern uint GetPixel(IntPtr dc,int x,int y);
+    [DllImport("dwmapi")] static extern int DwmFlush();
+    public static int CheckPlusDuringSwitch(IntPtr bar,int index) {
+        IntPtr tabs=GetDlgItem(bar,102),plus=GetDlgItem(bar,100);
+        Rect r=Bounds(plus);
+        Point p=new Point { X=(r.Left+r.Right-2)/2,Y=(r.Top+r.Bottom-2)/2 };
+        if (WindowFromPoint(p)!=plus) throw new Exception("Plus is covered.");
+        IntPtr dc=GetDC(IntPtr.Zero);
+        try {
+            DwmFlush();
+            uint ink=GetPixel(dc,p.X,p.Y);
+            if (ink==0xffffffff || ink==GetPixel(dc,r.Left+1,r.Top+1)) throw new Exception("Plus glyph not found.");
+            IntPtr click=(IntPtr)((8<<16)|(ItemWidth(tabs)*index+12));
+            if (!PostMessage(tabs,0x201,(IntPtr)1,click) || !PostMessage(tabs,0x202,IntPtr.Zero,click))
+                throw new Exception("Could not switch tabs.");
+            int settled=0, samples=0;
+            var clock=System.Diagnostics.Stopwatch.StartNew();
+            do {
+                DwmFlush();
+                if (GetPixel(dc,p.X,p.Y)!=ink) throw new Exception("Plus glyph changed brightness during a tab switch.");
+                ++samples;
+                settled=IsWindowEnabled(tabs) && Index(bar)==index ? settled+1 : 0;
+            } while (settled<3 && clock.ElapsedMilliseconds<4000);
+            if (settled<3) throw new Exception("Tab switch did not finish.");
+            return samples;
+        } finally { ReleaseDC(IntPtr.Zero,dc); }
     }
 }
 '@
@@ -132,6 +171,7 @@ function Test-Density {
     [void][BandTest]::GetCursorPos([ref]$saved)
     try {
         [BandTest]::WatchPager($tabs)
+        [BandTest]::Topmost($root,$true)
         $window.Width = 760
         $r = [BandTest]::Bounds($bar)
         $dpi = [BandTest]::GetDpiForWindow($tabs)
@@ -162,16 +202,8 @@ function Test-Density {
             'PASS: a full window declined an ordinary external open.'
         } else {
             # Address the full fixture directly so the user's existing frames cannot receive the test folder.
-            $source = New-TestExplorer $child -Separate
-            try {
-                $sourceRoot = [IntPtr][long]$source.HWND
-                if (![BandTest]::Find($sourceRoot).ToInt64()) { $source.ShowBrowserBar($id,$true,$null) }
-                $sourceBar = [IntPtr](Wait-For 'donor test band' { [BandTest]::Find($sourceRoot).ToInt64() })
-                $birth = [FixtureWindow]::GetProp($sourceBar,'EZFolder.Created.2')
-                if ($birth -eq [IntPtr]::Zero -or ![FixtureWindow]::SetProp($sourceBar,'EZFolder.MergeTarget.2',$bar)) { throw 'Could not prepare donor offer.' }
-                if ([BandTest]::AcceptsOffer($bar,$sourceBar,$birth) -or [BandTest]::Count($bar) -ne $capacity) { throw 'Full window accepted a merge offer.' }
-                'PASS: full window declined a merge offer from a second Explorer frame.'
-            } finally { $source.Quit() }
+            if ([BandTest]::AcceptsFolder($bar,$child) -or [BandTest]::Count($bar) -ne $capacity) { throw 'Full window accepted a new directory.' }
+            'PASS: full window declined a new directory sent directly to it.'
         }
         $window.Width = 510
         Wait-For 'shrink preserves every tab in a single row without a paging control' { [BandTest]::Bounds($bar).Right-[BandTest]::Bounds($bar).Left -lt $r.Right-$r.Left -and ![BandTest]::Paging($tabs) -and [BandTest]::Send($tabs,0x132c,0,0) -eq 1 -and [BandTest]::Count($bar) -eq $capacity } | Out-Null
@@ -188,6 +220,7 @@ function Test-Density {
         "PASS: $capacity tabs in a $($r.Right-$r.Left) pixel band, fixed plus, no paging, full hover title, resize and release."
     } finally {
         [void][BandTest]::StopWatchingPager()
+        [BandTest]::Topmost($root,$false)
         [void][BandTest]::SetCursorPos($saved.X,$saved.Y)
         [void][BandTest]::SetThreadDpiAwarenessContext($dpiContext)
         $window.Width = $width
@@ -214,6 +247,23 @@ try {
     Wait-For 'second tab' { [BandTest]::Count($bar) -eq 2 -and [BandTest]::Index($bar) -eq 1 } | Out-Null
     $pc = $shell.NameSpace(17).Self.Path
     Wait-For 'plus opens This PC by default' { $window.Document.Folder.Self.Path -eq $pc } | Out-Null
+    if ($TestPlusPaint) {
+        $ctx=[BandTest]::SetThreadDpiAwarenessContext([IntPtr](-4))
+        try {
+            $window.Left=40; $window.Top=80; $window.Width=900; $window.Height=560
+            [BandTest]::Topmost($root,$true)
+            [void][BandTest]::SetForegroundWindow($root)
+            Wait-For 'initial view ready' { [BandTest]::IsWindowEnabled($plus) -and [BandTest]::IsWindowEnabled([BandTest]::GetDlgItem($bar,102)) } | Out-Null
+            $samples=0
+            for ($i=0;$i -lt 12;$i++) {
+                $index=$i%2
+                $samples+=[BandTest]::CheckPlusDuringSwitch($bar,$index)
+                $expected=if ($index) { $pc } else { $folder }
+                Wait-For 'switched directory' { $window.Document.Folder.Self.Path -eq $expected } | Out-Null
+            }
+            "PASS: plus glyph stayed stable over 12 tab switches ($samples screen samples)."
+        } finally { [BandTest]::Topmost($root,$false); [void][BandTest]::SetThreadDpiAwarenessContext($ctx) }
+    }
     $settings.SetValue('NewTabLocation',1,[Microsoft.Win32.RegistryValueKind]::DWord)
     [void][BandTest]::Send($bar,0x111,100,0)
     Wait-For 'plus opens Quick Access after setting change' {

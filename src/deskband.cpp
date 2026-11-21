@@ -1138,7 +1138,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             if (plain && GetFocus()==tabs) SetFocus(add);
             ShowWindow(tabs,plain ? SW_HIDE : SW_SHOWNA);
         }
-        EnableWindow(add,room && (active >= 0 || nativeLocation) && destination < 0 && separating < 0);
+        bool addAvailable=room && (active>=0 || nativeLocation) && separating<0;
+        // Navigation briefly locks input. Keep the glyph at its normal brightness.
+        theme.setAddAvailable(add,addAvailable);
+        EnableWindow(add,addAvailable && destination<0);
         int item = std::clamp((available-scale(6))/count,1,scale(132));
         int height = std::max(1,static_cast<int>(r.bottom)-scale(3));
         bool resize = stripSize.cx != available || stripSize.cy != r.bottom;

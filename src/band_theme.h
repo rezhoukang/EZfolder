@@ -6,6 +6,7 @@ class BandTheme {
     COLORREF background{}, surface{}, hover{}, edge{}, text{}, selectedText{};
     COLORREF closeHover{};
     bool highContrast=false, showClose=true;
+    bool addAvailable=false;
     HWND hotWindow = nullptr;
     int hotTab = -1;
     POINT hotPoint{};
@@ -98,7 +99,7 @@ class BandTheme {
             r.bottom += (r.bottom-r.top) & 1;
             if (hotWindow == w) rounded(dc,r,hover,px(8));
             int x = (r.left+r.right-2)/2, y = (r.top+r.bottom-2)/2, arm = px(6);
-            COLORREF ink = IsWindowEnabled(w) ? text : edge;
+            COLORREF ink = addAvailable ? text : edge;
             line(dc,x-arm,y,x+arm+1,y,ink);
             line(dc,x,y-arm,x,y+arm+1,ink);
             if (focus) DrawFocusRect(dc,&r);
@@ -168,6 +169,11 @@ class BandTheme {
         }
     }
 public:
+    void setAddAvailable(HWND button,bool available) {
+        if (addAvailable==available) return;
+        addAvailable=available;
+        InvalidateRect(button,nullptr,FALSE);
+    }
     bool renderDrag(HWND popup,HWND tabs,int index,int dpi,POINT pointer,POINT press,POINT& grip) {
         RECT strip{},r{};
         if (!GetClientRect(tabs,&strip) || !TabCtrl_GetItemRect(tabs,index,&r)) return false;
