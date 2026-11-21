@@ -20,13 +20,64 @@ class BandTheme {
         SelectObject(dc, GetStockObject(NULL_PEN));
         RoundRect(dc, r.left,r.top,r.right,r.bottom,radius,radius);
     }
+    struct TabSurface {
+        BITMAPINFO info{};
+        COLORREF inside{}, outside{};
+        int diameter=0;
+        std::vector<DWORD> pixels;
+
+        // A 32-bit BI_RGB DIB stores the blue channel in the low byte.
+        static DWORD blend(COLORREF fg, COLORREF bg, int coverage) {
+            auto channel=[coverage](int a,int b) { return (coverage*a+(64-coverage)*b+32)/64; };
+            return RGB(channel(GetBValue(fg),GetBValue(bg)),channel(GetGValue(fg),GetGValue(bg)),
+                       channel(GetRValue(fg),GetRValue(bg)));
+        }
+        void paint(HDC dc, const RECT& r, int curve, COLORREF fg, COLORREF bg) {
+            // Match the footprint of the original penless GDI RoundRect.
+            int width=r.right-r.left-1, height=r.bottom-r.top-1;
+            if (width<=0 || height<=0) return;
+            curve=std::min({curve,width,height});
+            auto& header=info.bmiHeader;
+            if (header.biWidth!=width || header.biHeight!=-height || diameter!=curve || inside!=fg || outside!=bg) {
+                header.biSize=sizeof(header);
+                header.biWidth=width;
+                header.biHeight=-height;
+                header.biPlanes=1;
+                header.biBitCount=32;
+                diameter=curve;
+                inside=fg;
+                outside=bg;
+                pixels.assign(size_t(width)*height,blend(fg,bg,64));
+                // Sample one quadrant on an 8x8 grid and mirror it to all four corners.
+                const int radius=curve*8;
+                for (int y=0;y<(curve+1)/2;++y) {
+                    for (int x=0;x<(curve+1)/2;++x) {
+                        int coverage=0;
+                        for (int sy=0;sy<8;++sy) {
+                            int dy=std::max(0,radius-(16*y+2*sy+1));
+                            for (int sx=0;sx<8;++sx) {
+                                int dx=std::max(0,radius-(16*x+2*sx+1));
+                                coverage+=dx*dx+dy*dy<=radius*radius;
+                            }
+                        }
+                        DWORD color=blend(fg,bg,coverage);
+                        int right=width-1-x, bottom=height-1-y;
+                        pixels[y*width+x]=pixels[y*width+right]=color;
+                        pixels[bottom*width+x]=pixels[bottom*width+right]=color;
+                    }
+                }
+            }
+            SetDIBitsToDevice(dc,r.left,r.top,width,height,0,0,0,height,pixels.data(),&info,DIB_RGB_COLORS);
+        }
+    };
+    TabSurface selectedSurface, hoverSurface;
     static void line(HDC dc, int x, int y, int x2, int y2, COLORREF color) {
         SelectObject(dc, GetStockObject(DC_PEN));
         SetDCPenColor(dc,color);
         MoveToEx(dc,x,y,nullptr);
         LineTo(dc,x2,y2);
     }
-    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, RECT dirty, int dpi) const {
+    void draw(HWND w, HWND tabs, HDC dc, RECT bounds, RECT dirty, int dpi) {
         auto px = [dpi](int n) { return MulDiv(n,dpi,96); };
         fill(dc,dirty,background);
         SetBkMode(dc,TRANSPARENT);
@@ -64,7 +115,10 @@ class BandTheme {
             r.top = px(2);
             r.bottom = bounds.bottom - px(1);
             COLORREF ink = active ? selectedText : text;
-            if (active || hot) rounded(dc,r,active ? surface : hover,px(10));
+            if (active || hot) {
+                auto& cached=active ? selectedSurface : hoverSurface;
+                cached.paint(dc,r,px(10),active ? surface : hover,background);
+            }
             if (!active && i+1 < count && i+1 != selected)
                 line(dc,r.right-1,px(6),r.right-1,r.bottom-px(5),edge);
             wchar_t title[512]{};
