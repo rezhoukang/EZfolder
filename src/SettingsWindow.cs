@@ -170,8 +170,7 @@ static class SettingsProgram {
             reset.Click+=delegate { editor.Reset(); pc.Checked=true; showClose.Checked=ctrlClick.Checked=true; };
             buttons.Controls.AddRange(new Forms.Control[]{ok,cancel,reset});
             var hint=new Forms.Label {Visible=false,AutoSize=true};
-            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,showClose,ctrlClick,
-                new Forms.Label {Text="快捷键",AutoSize=true},hint});
+            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签页默认打开",AutoSize=true},pc,quick,showClose,ctrlClick,hint});
             for (int i=0;i<ShortcutEditor.Names.Length;i++) {
                 int index=i;
                 var row=new Forms.FlowLayoutPanel {AutoSize=true};
