@@ -9,13 +9,16 @@
         <RadioButton x:Name="ThisPC" Content="此电脑" GroupName="Location" />
         <RadioButton x:Name="QuickAccess" Content="快速访问" GroupName="Location" />
         <TextBlock Text="快捷键" Style="{StaticResource SubtitleTextBlockStyle}" Margin="0,20,0,4" />
-        <TextBlock x:Name="ShortcutHint" TextWrapping="Wrap" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,6" />
+        <TextBlock x:Name="ShortcutHint" Visibility="Collapsed" TextWrapping="Wrap" Style="{StaticResource CaptionTextBlockStyle}" Margin="0,0,0,6" />
         <StackPanel x:Name="Shortcuts" />
       </StackPanel>
     </ScrollViewer>
-    <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,16,0,0">
-            <Button x:Name="Save" Content="确定" MinWidth="80" />
-            <Button x:Name="Cancel" Content="取消" MinWidth="80" Margin="8,0,0,0" />
-            <Button x:Name="Reset" Content="重置默认值" Margin="16,0,0,0" />
-    </StackPanel>
+    <Grid Grid.Row="1" Margin="0,16,0,0">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Button x:Name="Save" Content="确定" MinWidth="80" />
+        <Button x:Name="Cancel" Grid.Column="1" Content="取消" MinWidth="80" Margin="8,0,0,0" />
+        <Button x:Name="Reset" Grid.Column="2" Content="重置默认值" HorizontalAlignment="Right" />
+    </Grid>
 </Grid>

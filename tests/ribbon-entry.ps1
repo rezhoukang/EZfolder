@@ -315,11 +315,14 @@ function Test-SettingsMenu {
             $popup = [IntPtr]::Zero
             $dialog = [IntPtr](Wait-For "standalone settings dialog ($action)" { [RibbonEntryTest]::SettingsDialog($button).ToInt64() })
             $selection = [Windows.Automation.SelectionItemPattern]::Pattern
+            $resetRect=(SettingControl 'Reset').Current.BoundingRectangle
+            $rowRect=(SettingControl 'Binding0').Current.BoundingRectangle
+            if ([Math]::Abs($resetRect.Right-$rowRect.Right) -gt 2) { throw 'Reset is not aligned to the right of the shortcut column.' }
             $reset = $action -in @('Reset','CancelReset')
             $current = if ($reset) { 'QuickAccess' } else { 'ThisPC' }
             if (!(SettingControl $current).GetCurrentPattern($selection).Current.IsSelected) { throw 'Dialog did not load the saved setting.' }
             for ($k=0;$k -lt $defaultKeys.Count;$k++) {
-                $expected = if ($reset -and $k -eq 0) { 'F6' } elseif ($reset -and $k -eq 4) { 'F8' } else { $defaultKeys[$k] }
+                $expected = if ($reset -and $k -eq 0) { 'F6' } elseif ($reset -and $k -eq 4) { 'F8' } elseif ($reset) { '-' } else { $defaultKeys[$k] }
                 if (!(SettingControl "Binding$k").Current.Name.EndsWith($expected)) { throw "Wrong shortcut for action $k" }
             }
             if ($reset) {
@@ -337,7 +340,14 @@ function Test-SettingsMenu {
                 [RibbonEntryTest]::Stroke($dialog,0x75)
                 Wait-For 'duplicate rejected' { (SettingControl 'ShortcutHint').Current.Name.Contains('已用于') } | Out-Null
                 [RibbonEntryTest]::Stroke($dialog,27)
-                Wait-For 'Escape restored old chord' { (SettingControl 'Binding1').Current.Name.EndsWith($defaultKeys[1]) } | Out-Null
+                Wait-For 'Escape clears the binding' { (SettingControl 'Binding1').Current.Name.EndsWith('-') } | Out-Null
+                foreach ($binding in 2,3) {
+                    $key = if ($binding -eq 2) { 46 } else { 8 }
+                    (SettingControl "Binding$binding").GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+                    Wait-For "start clearing binding $binding" { (SettingControl "Binding$binding").Current.Name.Contains('请按快捷键') } | Out-Null
+                    [RibbonEntryTest]::Stroke($dialog,$key)
+                    Wait-For "key $key clears the binding" { (SettingControl "Binding$binding").Current.Name.EndsWith('-') } | Out-Null
+                }
                 (SettingControl 'Binding4').GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
                 Wait-For 'restore shortcut capture' { (SettingControl 'Binding4').Current.Name.Contains('请按快捷键') } | Out-Null
                 [RibbonEntryTest]::Stroke($dialog,0x77)
@@ -353,6 +363,10 @@ function Test-SettingsMenu {
                 $quick = [int]($action -ne 'Reset')
                 $newKey = if ($quick) { 0x75 } else { 0x154 }
                 $restoreKey = if ($quick) { 0x77 } else { 0x354 }
+                foreach ($binding in 1,2,3) {
+                    $expectedKey = if ($quick) { 0 } else { @(0x157,0x109,0x309)[$binding-1] }
+                    if ([BitConverter]::ToInt32($blob,4*($binding+1)) -ne $expectedKey) { throw "Incorrect cleared/reset binding $binding." }
+                }
                 if ($blob.Length -ne 24 -or [BitConverter]::ToInt32($blob,20) -ne $restoreKey) { throw 'Incorrect saved restore binding.' }
                 if ([BitConverter]::ToInt32($blob,0) -ne $quick -or [BitConverter]::ToInt32($blob,4) -ne $newKey) { throw "Incorrect saved $action settings." }
                 if ($action -eq 'CancelReset') { continue }

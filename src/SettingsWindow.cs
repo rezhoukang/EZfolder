@@ -74,7 +74,8 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
             row.Children.Add(button); rows.Children.Add(row); keys[i]=button;
         }
         Action refresh=delegate {
-            hint.Text=editor.HintText;
+            hint.Text=editor.HintText ?? "";
+            hint.Visibility=editor.HintText==null ? Visibility.Collapsed : Visibility.Visible;
             for(int i=0;i<keys.Length;i++) {
                 keys[i].Content=editor.Caption(i);
                 Windows.UI.Xaml.Automation.AutomationProperties.SetName(keys[i],ShortcutEditor.Names[i]+"，"+editor.Caption(i));
@@ -151,14 +152,17 @@ static class SettingsProgram {
             var pc=new Forms.RadioButton { Text="此电脑",AutoSize=true };
             var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=editor.QuickAccess };
             pc.Checked=!quick.Checked;
-            var buttons=new Forms.FlowLayoutPanel { AutoSize=true };
+            var buttons=new Forms.TableLayoutPanel { AutoSize=true, ColumnCount=3, Dock=Forms.DockStyle.Fill };
+            buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
+            buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
+            buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.Percent,100));
             var ok=new Forms.Button {Text="确定"};
             var cancel=new Forms.Button {Text="取消",DialogResult=Forms.DialogResult.Cancel};
             ok.Click+=delegate { if (editor.Save(form,quick.Checked)) form.Close(); };
-            var reset=new Forms.Button { Text="重置默认值",AutoSize=true };
+            var reset=new Forms.Button { Text="重置默认值",AutoSize=true,Anchor=Forms.AnchorStyles.Right };
             reset.Click+=delegate { editor.Reset(); pc.Checked=true; };
             buttons.Controls.AddRange(new Forms.Control[]{ok,cancel,reset});
-            var hint=new Forms.Label {Text=ShortcutEditor.Hint,AutoSize=true};
+            var hint=new Forms.Label {Visible=false,AutoSize=true};
             content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,
                 new Forms.Label {Text="快捷键",AutoSize=true},hint});
             for (int i=0;i<ShortcutEditor.Names.Length;i++) {
@@ -167,10 +171,11 @@ static class SettingsProgram {
                 var binding=new Forms.Button {Text=editor.Caption(i),Width=150};
                 binding.Click+=delegate {editor.Begin(index);};
                 binding.Leave+=delegate {if(editor.Recording==index) editor.CancelCapture();};
-                editor.Changed+=delegate {binding.Text=editor.Caption(index); hint.Text=editor.HintText;};
+                editor.Changed+=delegate {binding.Text=editor.Caption(index);};
                 row.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text=ShortcutEditor.Names[i]},binding});
                 content.Controls.Add(row);
             }
+            editor.Changed+=delegate { hint.Text=editor.HintText; hint.Visible=editor.HintText!=null; };
             content.Controls.Add(buttons);
             form.Controls.Add(content);
             form.AcceptButton=ok; form.CancelButton=cancel;
