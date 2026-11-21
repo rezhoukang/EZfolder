@@ -81,6 +81,8 @@ constexpr wchar_t readyProp[] = L"EZFolder.Ready.3";
 constexpr wchar_t foregroundProp[] = L"EZFolder.OpenForeground";
 constexpr wchar_t inputProp[] = L"EZFolder.OpenInput";
 constexpr wchar_t countProp[] = L"EZFolder.TabCount";
+constexpr wchar_t emptyProp[] = L"EZFolder.NativeView";
+inline bool hasView(HWND band) { return GetPropW(band,countProp) || GetPropW(band,emptyProp); }
 constexpr wchar_t countSinceProp[] = L"EZFolder.TabCountSince";
 constexpr wchar_t primaryProp[] = L"EZFolder.Primary";
 inline UINT openPath() { static UINT id = RegisterWindowMessageW(L"EZFolder.OpenFolder.4"); return id; }
@@ -119,7 +121,7 @@ inline BOOL CALLBACK olderWindow(HWND root, LPARAM data) {
     auto birth = reinterpret_cast<ULONG_PTR>(GetPropW(candidate, birthProp));
     auto own = reinterpret_cast<ULONG_PTR>(GetPropW(s.source, birthProp));
     if (s.source && !(birth < own || (birth == own && reinterpret_cast<UINT_PTR>(candidate) < reinterpret_cast<UINT_PTR>(s.source)))) return TRUE;
-    if (!s.source && (!number(candidate,countProp) || !GetPropW(candidate,readyProp))) return TRUE;
+    if (!s.source && (!hasView(candidate) || !GetPropW(candidate,readyProp))) return TRUE;
     auto rank=[](HWND w) {
         return std::make_tuple(!GetPropW(w,startingProp),!!GetPropW(w,primaryProp),number(w,countProp),
             ~number(w,countSinceProp),~number(w,birthProp),~reinterpret_cast<UINT_PTR>(w));

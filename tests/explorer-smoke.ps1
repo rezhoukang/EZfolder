@@ -10,7 +10,7 @@ public static class BandTest {
     delegate bool Visit(IntPtr w, IntPtr p);
     [DllImport("user32")] static extern bool EnumChildWindows(IntPtr w, Visit visit, IntPtr p);
     [DllImport("user32")] public static extern IntPtr GetDlgItem(IntPtr w, int id);
-    [DllImport("user32")] static extern bool IsWindowVisible(IntPtr w);
+    [DllImport("user32")] public static extern bool IsWindowVisible(IntPtr w);
     [DllImport("user32", SetLastError=true)] static extern IntPtr SendMessageTimeout(IntPtr w, int m, IntPtr a, IntPtr b, int flags, int timeout, out IntPtr result);
     public static IntPtr Find(IntPtr root) {
         IntPtr found = IntPtr.Zero;
@@ -75,6 +75,12 @@ public static class BandTest {
     [DllImport("user32")] static extern uint GetWindowThreadProcessId(IntPtr w,out uint pid);
     [DllImport("user32",CharSet=CharSet.Unicode,EntryPoint="SendMessageTimeoutW")]
     static extern IntPtr ReadText(IntPtr w,int m,IntPtr a,System.Text.StringBuilder b,int flags,int ms,out IntPtr result);
+    public static bool PlainLocation(IntPtr bar,string name) {
+        IntPtr label=GetDlgItem(bar,104),result;
+        var text=new System.Text.StringBuilder(256);
+        return !String.IsNullOrEmpty(name) && Count(bar)==0 && Index(bar)==-1 && !IsWindowVisible(GetDlgItem(bar,102)) &&
+            IsWindowVisible(label) && ReadText(label,13,(IntPtr)text.Capacity,text,2,500,out result)!=IntPtr.Zero && text.ToString()==name;
+    }
     public static bool HasTitle(IntPtr tabs,string title) {
         uint owner,pid; GetWindowThreadProcessId(tabs,out owner);
         for (IntPtr w=FindWindowEx(IntPtr.Zero,IntPtr.Zero,"tooltips_class32",null);w!=IntPtr.Zero;w=FindWindowEx(IntPtr.Zero,w,"tooltips_class32",null)) {
@@ -244,17 +250,21 @@ try {
     $independent.Quit()
     $testWindows = @()
     [void][BandTest]::Send($tabs,0x208,0,((8 -shl 16) -bor 12))
-    Wait-For 'last tab resets to preferred Quick Access' { [BandTest]::Count($bar) -eq 1 -and $window.Document.Folder.Self.Path -match '679f85cb' } | Out-Null
+    Wait-For 'middle-close leaves only the native Quick Access label' { $window.Document.Folder.Self.Path -match '679f85cb' -and [BandTest]::PlainLocation($bar,$window.Document.Folder.Self.Name) } | Out-Null
+    [void][BandTest]::Send($plus,0xF5,0,0)
+    Wait-For 'plus creates the first real tab even at the same location' { [BandTest]::Count($bar) -eq 1 -and [BandTest]::Index($bar) -eq 0 -and [BandTest]::IsWindowVisible($tabs) } | Out-Null
     $settings.SetValue('NewTabLocation',0,[Microsoft.Win32.RegistryValueKind]::DWord)
     [BandTest]::ClickTab($bar,[BandTest]::ItemWidth($tabs)-[int](8*$dpi/96))
-    Wait-For 'last tab X resets to This PC' { [BandTest]::Count($bar) -eq 1 -and $window.Document.Folder.Self.Path -eq $pc } | Out-Null
+    Wait-For 'last tab X leaves only the native This PC label' { $window.Document.Folder.Self.Path -eq $pc -and [BandTest]::PlainLocation($bar,$window.Document.Folder.Self.Name) } | Out-Null
+    $window.Navigate2($folder)
+    Wait-For 'native navigation keeps the bar empty and updates the label' { $window.Document.Folder.Self.Path -eq $folder -and [BandTest]::PlainLocation($bar,$window.Document.Folder.Self.Name) } | Out-Null
     'PASS: This PC, Quick Access, per-tab close, switching and drag-out.'
-    if (@($shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and [FixtureWindow]::GetProp([IntPtr][long]$_.HWND,'EZFolder.Band.2') -ne [IntPtr]::Zero }).Count) {
+    if (@($shell.Windows() | Where-Object { $_.HWND -ne $window.HWND -and [BandTest]::IsWindowVisible([FixtureWindow]::GetProp([IntPtr][long]$_.HWND,'EZFolder.Band.2')) }).Count) {
         'SKIP: another band is open and could receive the test merge.'
         return
     }
-    $window.Navigate2($child)
-    Wait-For 'source at child' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
+    Open-TestFolder $child
+    Wait-For 'empty receiver gets one real tab for an external folder' { [BandTest]::Count($bar) -eq 1 -and [BandTest]::Index($bar) -eq 0 -and $window.Document.Folder.Self.Path -eq $child } | Out-Null
     Open-TestFolder $folder
     Wait-For 'external open becomes a second tab in the original HWND' {
         [BandTest]::Count($bar) -eq 2 -and $window.Document.Folder.Self.Path -eq $folder

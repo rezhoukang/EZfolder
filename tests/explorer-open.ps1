@@ -11,6 +11,7 @@ public static class OpenTest {
     [DllImport("user32")] public static extern bool SetForegroundWindow(IntPtr w);
     [DllImport("user32")] public static extern bool IsIconic(IntPtr w);
     [DllImport("user32")] public static extern bool IsWindow(IntPtr w);
+    [DllImport("user32")] public static extern bool IsWindowVisible(IntPtr w);
     [StructLayout(LayoutKind.Sequential)] struct GuiInfo {
         public int size,flags; public IntPtr active,focus,capture,menu,move,caret; public int x,y,right,bottom;
     }
@@ -33,11 +34,13 @@ public static class OpenTest {
     [DllImport("user32")] static extern bool SetCursorPos(int x,int y);
     [DllImport("user32")] static extern void mouse_event(uint flags,uint x,uint y,uint data,UIntPtr info);
     [DllImport("user32")] static extern void keybd_event(byte vk,byte scan,uint flags,UIntPtr info);
-    public static void Ctrl(IntPtr root,char letter) {
+    public static void Ctrl(IntPtr root,char letter,bool shift=false) {
         if (GetForegroundWindow()!=root) throw new Exception("Explorer lost focus before keyboard input.");
         keybd_event(0x11,0,0,UIntPtr.Zero);
+        if (shift) keybd_event(0x10,0,0,UIntPtr.Zero);
         keybd_event((byte)letter,0,0,UIntPtr.Zero);
         keybd_event((byte)letter,0,2,UIntPtr.Zero);
+        if (shift) keybd_event(0x10,0,2,UIntPtr.Zero);
         keybd_event(0x11,0,2,UIntPtr.Zero);
     }
     public static void ClickLauncher(IntPtr w) {
@@ -66,7 +69,7 @@ function Wait-Open($label,[scriptblock]$probe) {
 }
 $shell = New-Object -ComObject Shell.Application
 foreach ($web in $shell.Windows()) {
-    if ([FixtureWindow]::GetProp([IntPtr][long]$web.HWND,'EZFolder.Band.2') -ne [IntPtr]::Zero) {
+    if ([OpenTest]::IsWindowVisible([FixtureWindow]::GetProp([IntPtr][long]$web.HWND,'EZFolder.Band.2'))) {
         throw 'Another Explorer band could receive the test open.'
     }
 }
@@ -127,11 +130,20 @@ try {
         [OpenTest]::Ctrl($root,'W')
         Wait-Open 'Ctrl+W from address bar closes one tab' { [OpenTest]::Count($bar) -eq $before-1 }
     }
+    $lastFolder=$window.Document.Folder.Self.Path
     [OpenTest]::Ctrl($root,'W')
     Wait-Open 'last tab returns to the default location in the original frame' {
-        [OpenTest]::IsWindow($root) -and [OpenTest]::Count($bar) -eq 1 -and
+        [OpenTest]::IsWindow($root) -and [OpenTest]::Count($bar) -eq 0 -and
             $window.Document.Folder.Self.Path -match '20D04FE0|679f85cb'
     }
+    [OpenTest]::Ctrl($root,'W')
+    Start-Sleep -Milliseconds 150
+    [OpenTest]::Ctrl($root,'T',$true)
+    Wait-Open 'restore the last closed folder as the only tab' { [OpenTest]::Count($bar) -eq 1 -and $window.Document.Folder.Self.Path -eq $lastFolder }
+    [OpenTest]::Ctrl($root,'W')
+    Wait-Open 'receiver is empty again' { [OpenTest]::Count($bar) -eq 0 }
+    $shell.Explore($paths[0])
+    Wait-Open 'external open takes the first slot in the same frame' { [OpenTest]::Count($bar) -eq 1 -and $window.Document.Folder.Self.Path -eq $paths[0] }
     'PASS: receiver activated from another foreground window and restored from minimized. Ctrl+W preserved the frame.'
 } finally {
     if ($launcher) { $launcher.Dispose() }
