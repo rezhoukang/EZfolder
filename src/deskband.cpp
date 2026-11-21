@@ -1092,6 +1092,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             }
             if (msg==WM_DRAWITEM && lp) {
                 auto* item=reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+                // Buttons can redraw synchronously on state changes, outside WM_PAINT.
+                if (item->CtlType==ODT_BUTTON && item->CtlID==NewTab) {
+                    self->theme.paint(item->hwndItem,self->tabs,item->hDC,self->scale(96));
+                    return TRUE;
+                }
                 if (item->CtlType==ODT_MENU) { self->theme.menuItem(*item,self->scale(96)); return TRUE; }
             }
             if (msg==WM_RBUTTONDOWN) return 0;
@@ -1233,7 +1238,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         // The multiline variant has no pager. layout() fits the items into a single visible row.
         tabs = child(WC_TABCONTROLW, L"文件夹标签", TabControl,
                      TCS_MULTILINE | TCS_RAGGEDRIGHT | TCS_FIXEDWIDTH | TCS_FOCUSONBUTTONDOWN | WS_CLIPCHILDREN);
-        add = child(WC_BUTTONW, L"新建标签页", NewTab, BS_PUSHBUTTON);
+        add = child(WC_BUTTONW, L"新建标签页", NewTab, BS_OWNERDRAW);
         NONCLIENTMETRICSW metrics{};
         metrics.cbSize = sizeof(metrics);
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))

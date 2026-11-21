@@ -205,7 +205,8 @@ try {
     $bar = [IntPtr]$bar
     Wait-For 'initial folder tab' { [BandTest]::Count($bar) -eq 1 } | Out-Null
     if ($TestDensity) { Test-Density }
-    [BandTest]::Send($bar,0x111,100,0) | Out-Null
+    $plus = [BandTest]::GetDlgItem($bar,100)
+    [BandTest]::Send($plus,0xF5,0,0) | Out-Null # BM_CLICK exercises the button's pressed and released states.
     Wait-For 'second tab' { [BandTest]::Count($bar) -eq 2 -and [BandTest]::Index($bar) -eq 1 } | Out-Null
     $pc = $shell.NameSpace(17).Self.Path
     Wait-For 'plus opens This PC by default' { $window.Document.Folder.Self.Path -eq $pc } | Out-Null
