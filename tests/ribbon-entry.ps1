@@ -1,6 +1,6 @@
-﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation,[switch]$TestQuickDrop)
+﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation,[switch]$TestQuickDrop,[switch]$TestCtrlOpen)
 $ErrorActionPreference = 'Stop'
-Add-Type @'
+Add-Type -ReferencedAssemblies Accessibility -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -90,6 +90,7 @@ public static class RibbonEntryTest {
     public static bool Focused(IntPtr w) { var g=new GuiInfo();g.size=Marshal.SizeOf(g);return GetGUIThreadInfo(0,ref g)&&g.focus==w; }
     [DllImport("user32")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32")] static extern void keybd_event(byte key,byte scan,uint flags,UIntPtr extra);
+    public static void HoldCtrl(bool down) { keybd_event(17,0,down ? 0u : 2u,UIntPtr.Zero); }
     public static void RestoreShortcut(IntPtr root,IntPtr tabs) {
         if(GetForegroundWindow()!=root || Focused(tabs)) throw new Exception("Expected focus in the Explorer window outside the tab strip.");
         foreach(byte key in new byte[]{17,16,84}) keybd_event(key,0,0,UIntPtr.Zero);
@@ -161,6 +162,63 @@ public static class RibbonEntryTest {
             mouse_event(4,0,0,0,UIntPtr.Zero);
         } finally { keybd_event(17,0,2,UIntPtr.Zero); }
     }
+    public static void CtrlKey(IntPtr root,byte vk) {
+        if(GetForegroundWindow()!=root) throw new Exception("Fixture is not the foreground window.");
+        keybd_event(17,0,0,UIntPtr.Zero);
+        try { keybd_event(vk,0,0,UIntPtr.Zero); keybd_event(vk,0,2,UIntPtr.Zero); }
+        finally { keybd_event(17,0,2,UIntPtr.Zero); }
+    }
+    [DllImport("user32")] static extern uint GetMenuDefaultItem(IntPtr menu,bool pos,uint flags);
+    [DllImport("user32",CharSet=CharSet.Unicode)] static extern int GetMenuString(IntPtr menu,uint id,StringBuilder name,int max,uint flags);
+    public static void ContextOpen(IntPtr root,Point point) {
+        if (GetAncestor(WindowFromPoint(point),2)!=root) throw new Exception("Item covered");
+        SetCursorPos(point.X,point.Y); mouse_event(8,0,0,0,UIntPtr.Zero); mouse_event(16,0,0,0,UIntPtr.Zero);
+        uint owner,other;GetWindowThreadProcessId(root,out owner);
+        for(int i=0;i<80;i++){
+            IntPtr popup=IntPtr.Zero;
+            while((popup=FindWindowEx(IntPtr.Zero,popup,"#32768",null))!=IntPtr.Zero) {
+                GetWindowThreadProcessId(popup,out other); if(other!=owner || !IsWindowVisible(popup)) continue;
+                IntPtr menu;if(SendMessageTimeout(popup,0x1e1,IntPtr.Zero,IntPtr.Zero,2,250,out menu)==IntPtr.Zero) continue;
+                uint pos=GetMenuDefaultItem(menu,true,0); if(pos==0xffffffff)continue;
+                var name=new StringBuilder(100);GetMenuString(menu,pos,name,100,0x400);
+                if(!name.ToString().StartsWith("打开(") && name.ToString()!="Open" && name.ToString()!="&Open")throw new Exception("Unexpected menu default "+name);
+                Rect r;if(!GetMenuItemRect(IntPtr.Zero,menu,(int)pos,out r))continue;
+                var at=new Point((r.Left+r.Right)/2,(r.Top+r.Bottom)/2);SetCursorPos(at.X,at.Y);System.Threading.Thread.Sleep(100);
+                HoldCtrl(true);try {mouse_event(2,0,0,0,UIntPtr.Zero);System.Threading.Thread.Sleep(50);mouse_event(4,0,0,0,UIntPtr.Zero);System.Threading.Thread.Sleep(80);}finally{HoldCtrl(false);}
+                return;
+            }
+            System.Threading.Thread.Sleep(60);
+        }
+        throw new Exception("Open command missing");
+    }
+    [DllImport("oleacc")] static extern int AccessibleObjectFromWindow(IntPtr w,uint id,ref Guid iid,out Accessibility.IAccessible obj);
+    [DllImport("shell32")] static extern void SHGetSettings(out uint flags,uint mask);
+    [DllImport("user32")] static extern IntPtr SendMessage(IntPtr w,uint m,IntPtr a,IntPtr b);
+    public static bool DoubleClickToOpen() { uint flags; SHGetSettings(out flags,0x80); return (flags & 0x20)!=0; }
+    public static void CtrlOpen(IntPtr root,Point point) {
+        if (!DoubleClickToOpen()) { CtrlClick(root,point); return; }
+        HoldCtrl(true);
+        try { OpenItem(root,point); } finally { HoldCtrl(false); }
+    }
+    public static Point TreeLabel(IntPtr root,string[] names) {
+        Point hit=new Point(-1,-1);
+        EnumChildWindows(root,(w,p)=>{
+            var cls=new StringBuilder(64); GetClassName(w,cls,64);
+            if(cls.ToString()!="SysTreeView32" || !IsWindowVisible(w)) return true;
+            Guid iid=typeof(Accessibility.IAccessible).GUID; Accessibility.IAccessible acc;
+            if(AccessibleObjectFromWindow(w,unchecked((uint)-4),ref iid,out acc)!=0) return true;
+            for(var node=SendMessage(w,0x110A,IntPtr.Zero,IntPtr.Zero);node!=IntPtr.Zero;node=SendMessage(w,0x110A,(IntPtr)6,node)){
+                int id=SendMessage(w,0x112B,node,IntPtr.Zero).ToInt32();
+                string name=acc.get_accName(id);
+                if(!Array.Exists(names,n=>name==n || name.StartsWith(n+" (",StringComparison.Ordinal))) continue;
+                SendMessage(w,0x1114,IntPtr.Zero,node);
+                int x,y,width,height; acc.accLocation(out x,out y,out width,out height,id);
+                hit=new Point(x+Math.Min(16,width/2),y+height/2); return false;
+            }
+            return true;
+        },IntPtr.Zero);
+        return hit;
+    }
     public static void Menu(IntPtr w) { PostMessage(w,0x7b,w,new IntPtr(-1)); }
     public static void Mouse(IntPtr w,int message,int x,int y) {
         IntPtr result;
@@ -200,6 +258,81 @@ function Test-Placement {
     $point = [RibbonEntryTest+Point]::new(($r.Left+$r.Right)/2,($r.Top+$r.Bottom)/2)
     return ([math]::Abs($dock.Right-$r.Right-$margin) -le 1 -and $r.Top -eq $dock.Top -and
         [RibbonEntryTest]::WindowFromPoint($point) -eq $button)
+}
+function Test-WindowCtrlOpen {
+    Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes,System.Windows.Forms
+    $window.Left=70; $window.Top=70; $window.Width=950; $window.Height=620
+    [void][RibbonEntryTest]::SetForegroundWindow($root)
+    $frame=[Windows.Automation.AutomationElement]::FromHandle($root)
+    $bar=[FixtureWindow]::GetProp($root,'EZFolder.Band.2')
+    $tabs=[RibbonEntryTest]::GetDlgItem($bar,102)
+    $computer=(New-Object -ComObject Shell.Application).NameSpace(17).Self
+    $pc=$computer.Path
+    $point=Wait-For 'This PC node' {
+        $hit=[RibbonEntryTest]::TreeLabel($root,@($computer.Name,'此电脑','This PC'))
+        if ($hit.X -ne -1) { $hit }
+    }
+    [RibbonEntryTest]::CtrlClick($root,$point)
+    Wait-For 'Ctrl-open from navigation pane preserves source and adds This PC' {
+        [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $pc
+    } | Out-Null
+    Wait-For 'source tabs ready to switch' { [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+    [RibbonEntryTest]::FocusTabs($root,$tabs)
+    Wait-For 'original tab after sidebar open' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+    $child=Join-Path $folder 'Keyboard'
+    $mouseFolder=Join-Path $folder 'Mouse'
+    $menuFolder=Join-Path $folder 'Menu'
+    [void][IO.Directory]::CreateDirectory($mouseFolder)
+    [void][IO.Directory]::CreateDirectory($menuFolder)
+    [void][IO.Directory]::CreateDirectory($child)
+    try {
+        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Keyboard')
+        $item=Wait-For 'keyboard target' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$name) }
+        $window.Document.SelectItem($window.Document.Folder.ParseName('Keyboard'),29)
+        $item.SetFocus()
+        [RibbonEntryTest]::CtrlKey($root,13)
+        Wait-For 'Ctrl+Enter in the content view adds selected folder' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 3 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $child
+        } | Out-Null
+        Wait-For 'source tabs ready to switch' { [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        [RibbonEntryTest]::FocusTabs($root,$tabs)
+        Wait-For 'original tab after keyboard open' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        $downloads=(New-Object -ComObject Shell.Application).NameSpace('shell:Downloads').Self
+        $pin=[RibbonEntryTest]::TreeLabel($root,@($downloads.Name,'下载','Downloads'))
+        if ($pin.X -ne -1) {
+            [RibbonEntryTest]::CtrlClick($root,$pin)
+            Wait-For 'Ctrl-opening Downloads from the navigation pane resolves the disk folder' {
+                [RibbonEntryTest]::TabCount($tabs) -eq 4 -and $window.Document.Folder.Self.Path -eq $downloads.Path
+            } | Out-Null
+            'PASS: Downloads navigation item opened its actual folder.'
+        }
+        Wait-For 'source tabs ready to switch' { [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        [RibbonEntryTest]::FocusTabs($root,$tabs)
+        Wait-For 'source directory before Ctrl double-click' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Mouse')
+        $item=Wait-For 'clickable folder for Ctrl double-click' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$name) }
+        $hit=$item.GetClickablePoint()
+        $before=[RibbonEntryTest]::TabCount($tabs)
+        $pt=[RibbonEntryTest+Point]::new($hit.X,$hit.Y)
+        if ([RibbonEntryTest]::DoubleClickToOpen()) {
+            [RibbonEntryTest]::CtrlClick($root,$pt)
+            Start-Sleep -Milliseconds ([System.Windows.Forms.SystemInformation]::DoubleClickTime+100)
+            if ([RibbonEntryTest]::TabCount($tabs) -ne $before -or $window.Document.Folder.Self.Path -ne $folder) { throw 'Ctrl single-click navigated in double-click mode.' }
+        }
+        [RibbonEntryTest]::CtrlOpen($root,$pt)
+        Wait-For 'Ctrl-open adds Mouse at the right' {
+            [RibbonEntryTest]::TabCount($tabs) -eq ($before+1) -and [RibbonEntryTest]::SelectedTab($tabs) -eq $before -and $window.Document.Folder.Self.Path -eq $mouseFolder
+        } | Out-Null
+        Wait-For 'source tabs ready to switch' { [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        [RibbonEntryTest]::FocusTabs($root,$tabs)
+        Wait-For 'source before context-menu Open' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Menu')
+        $item=Wait-For 'folder for context-menu Open' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$name) }
+        $hit=$item.GetClickablePoint()
+        [RibbonEntryTest]::ContextOpen($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
+        Wait-For 'Ctrl and native context-menu Open' { [RibbonEntryTest]::TabCount($tabs) -eq ($before+2) -and $window.Document.Folder.Self.Path -eq $menuFolder } | Out-Null
+        'PASS: sidebar and content view Ctrl-open, native mouse activation, keyboard, menu and path reuse.'
+    } finally { foreach ($path in $child,$mouseFolder,$menuFolder) { [IO.Directory]::Delete($path) } }
 }
 function Test-SingleQuickDrop {
     $shell=New-Object -ComObject Shell.Application
@@ -256,14 +389,14 @@ function Test-TabActions {
         [RibbonEntryTest]::Mouse($tabs,0x202,$x,8)
         Wait-For "select tab $index" { [RibbonEntryTest]::SelectedTab($tabs) -eq $index -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
     }
-    function Open-VisibleFolder($entry,[switch]$Ctrl) {
+    function Open-VisibleFolder($entry,[switch]$Ctrl,[switch]$Open) {
         $window.Document.SelectItem($entry,29)
         $selected=[Windows.Automation.PropertyCondition]::new([Windows.Automation.SelectionItemPattern]::IsSelectedProperty,$true)
         $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
         $item=Wait-For 'selected folder in content view' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($selected,$type)) }
         $hit=$item.GetClickablePoint()
         $point=[RibbonEntryTest+Point]::new($hit.X,$hit.Y)
-        if ($Ctrl) { [RibbonEntryTest]::CtrlClick($root,$point) } else { [RibbonEntryTest]::OpenItem($root,$point) }
+        if ($Open) { [RibbonEntryTest]::CtrlOpen($root,$point) } elseif ($Ctrl) { [RibbonEntryTest]::CtrlClick($root,$point) } else { [RibbonEntryTest]::OpenItem($root,$point) }
     }
     $other=$null
     try {
@@ -314,14 +447,15 @@ function Test-TabActions {
         $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
         $row=Wait-For 'unselected folder in the source view' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($name,$type)) }
         $hit=$row.GetClickablePoint()
-        [RibbonEntryTest]::CtrlClick($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
-        Wait-For 'Ctrl-click opens child in second tab' {
+        [RibbonEntryTest]::CtrlOpen($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
+        Wait-For 'Ctrl-open opens child in second tab' {
             [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) -and $window.Document.Folder.Self.Path -eq $child
         } | Out-Null
-        'PASS: Ctrl-click opened the clicked folder in a new tab.'
+        'PASS: Ctrl-open opened the folder in a new tab.'
         Select-TestTab 0
-        Open-VisibleFolder ($window.Document.Folder.ParseName('Moved')) -Ctrl
-        Wait-For 'Ctrl-click reuses an existing folder tab' {
+        Wait-For 'fixture folder loaded' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        Open-VisibleFolder ($window.Document.Folder.ParseName('Moved')) -Open
+        Wait-For 'Ctrl-open reuses an existing folder tab' {
             [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $child
         } | Out-Null
         Select-TestTab 0
@@ -370,7 +504,8 @@ function Test-TabActions {
                 Wait-For "folder open into $name" { [RibbonEntryTest]::TabCount($strip) -eq $count+1 -and $receiver.Document.Folder.Self.Path -eq $path } | Out-Null
             }
             [void][RibbonEntryTest]::SetForegroundWindow($root)
-            Open-RoutedFolder 'Primary' $other $otherTabs
+            [RibbonEntryTest]::HoldCtrl($true)
+            try { Open-RoutedFolder 'Primary' $other $otherTabs } finally { [RibbonEntryTest]::HoldCtrl($false) }
             if (![FixtureWindow]::GetProp($otherBar,'EZFolder.Primary').ToInt64()) { throw 'The larger window was not marked primary.' }
             $other.Width=480
             $plus=[RibbonEntryTest]::GetDlgItem($otherBar,100)
@@ -519,6 +654,14 @@ function Test-SettingsMenu {
                 [RibbonEntryTest]::Mouse($tabs,0x201,$x,12)
                 [RibbonEntryTest]::Mouse($tabs,0x202,$x,12)
                 if ([RibbonEntryTest]::TabCount($tabs) -ne $count -or $window.Document.Folder.Self.Path -ne $folder) { throw 'Disabled click options still changed tabs.' }
+                $pc=(New-Object -ComObject Shell.Application).NameSpace(17).Self
+                $node=[RibbonEntryTest]::TreeLabel($root,@($pc.Name,'此电脑','This PC'))
+                if ($node.X -eq -1) { throw 'Missing navigation item for disabled Ctrl-open.' }
+                [RibbonEntryTest]::CtrlClick($root,$node)
+                Wait-For 'disabled sidebar Ctrl-open navigates the current tab' {
+                    $window.Document.Folder.Self.Path -eq $pc.Path -and [RibbonEntryTest]::TabCount($tabs) -eq $count
+                } | Out-Null
+                $window.Navigate2($folder)
                 [RibbonEntryTest]::FocusTabs($root,$tabs)
                 Wait-For 'fixture selects original folder' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
                 Wait-For 'fixture tab has keyboard focus' {
@@ -591,12 +734,12 @@ try {
     $entry = [IntPtr](Wait-For 'ribbon entry' { [RibbonEntryTest]::Entry($root).ToInt64() })
     $button = [RibbonEntryTest]::GetDlgItem($entry,1)
     $initiallyShown = [RibbonEntryTest]::Shown($root)
-    if ($TestNavigation -or $TestQuickDrop) {
+    if ($TestNavigation -or $TestQuickDrop -or $TestCtrlOpen) {
         if (!$initiallyShown) {
             [RibbonEntryTest]::Click($button)
             Wait-For 'navigation fixture band' { [RibbonEntryTest]::Shown($root) } | Out-Null
         }
-        if ($TestQuickDrop) { Test-SingleQuickDrop } else { Test-TabActions }
+        if ($TestQuickDrop) { Test-SingleQuickDrop } elseif ($TestCtrlOpen) { Test-WindowCtrlOpen } else { Test-TabActions }
         return
     }
     if ($initiallyShown) { [RibbonEntryTest]::Click($button); Wait-For 'initial hide' { ![RibbonEntryTest]::Shown($root) } | Out-Null }

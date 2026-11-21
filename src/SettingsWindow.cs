@@ -157,7 +157,7 @@ static class SettingsProgram {
             var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=editor.QuickAccess };
             pc.Checked=!quick.Checked;
             var showClose=new Forms.CheckBox {Text="显示标签关闭按钮",AutoSize=true,Checked=editor.ShowClose};
-            var ctrlClick=new Forms.CheckBox {Text="Ctrl＋单击文件夹时在新标签中打开",AutoSize=true,Checked=editor.CtrlClick};
+            var ctrlClick=new Forms.CheckBox {Text="按住 Ctrl 键打开文件夹时在新标签中打开",AutoSize=true,Checked=editor.CtrlClick};
             var buttons=new Forms.TableLayoutPanel { AutoSize=true, ColumnCount=3, Dock=Forms.DockStyle.Fill };
             buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
             buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));

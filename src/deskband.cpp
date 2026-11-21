@@ -54,6 +54,14 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     int active = -1, destination = -1;
     // The default page after closing the last tab has no tab of its own.
     Location nativeLocation, closingTo;
+    Location ctrlPressedFolder;
+    HWND firstClickWindow=nullptr;
+    POINT firstClickPoint{};
+    DWORD firstClickTime=0;
+    HWND contextSurface=nullptr;
+    POINT contextPoint{};
+    bool keyboardMenu=false;
+    ULONGLONG nativeCtrlDeadline=0;
     bool closeAfterSwitch = false;
     bool rememberRemoval = false, restoring = false, copyToWindow = false, dragging = false;
     std::vector<Location> closed;
@@ -77,11 +85,16 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static constexpr UINT shortcutMessage = WM_APP + 30;
     static constexpr UINT navigateMessage = WM_APP + 31;
     static constexpr UINT ctrlClickMessage = WM_APP + 32;
+    static constexpr UINT ctrlOpenMessage = WM_APP + 33;
+    static constexpr UINT_PTR ctrlReleaseTimer = 2;
+    Location ctrlOpenTarget;
     int queuedTab = -1;
     bool presentQueued = false;
     bool watchingKeys = false;
     Band* nextOnThread = nullptr;
     inline static thread_local HHOOK threadKeys = nullptr;
+    inline static thread_local HHOOK threadMenus = nullptr;
+    inline static thread_local Band* menuBand = nullptr;
     inline static thread_local Band* threadBands = nullptr;
     inline static thread_local HWND ctrlDownWindow = nullptr;
     inline static thread_local POINT ctrlDownPoint{};
@@ -444,6 +457,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     int tabForOpen(Location& id,bool* added=nullptr) {
         // Explorer can navigate inside the active tab between timer ticks.
         sync();
+        nativeCtrlDeadline=0;
         int match=matchingTab(id.get());
         if (added) *added=match<0;
         if (match>=0) return match;
@@ -555,6 +569,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         Location id(parsed);
         if (!(attrs&SFGAO_FOLDER) || !bar || separating>=0 || incoming || closingTo) return false;
         if (query) { sync(); return matchingTab(id.get())>=0; }
+        if (move) nativeCtrlDeadline=0;
         if (!move) merge::markReceiver(bar);
         if (move && !hasRoom()) return false;
         int index=move ? append(std::move(id),false) : tabForOpen(id);
@@ -604,6 +619,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     }
     void sync(int* tracked=nullptr) {
         if (!tabs) return;
+        if (nativeCtrlDeadline && GetTickCount64()>=nativeCtrlDeadline) nativeCtrlDeadline=0;
         Location actual = current();
         if (destination >= 0) {
             if (actual && ILIsEqual(actual.get(), closingTo ? closingTo.get() : folders[destination].folder.get())) {
@@ -625,6 +641,8 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (nativeLocation && ILIsEqual(actual.get(),nativeLocation.get())) return;
         if (folders.empty()) append(std::move(actual));
         else if (active<0 || !ILIsEqual(actual.get(), folders[active].folder.get())) {
+            bool ctrlOpen=nativeCtrlDeadline!=0;
+            nativeCtrlDeadline=0;
             nextImported = -1;
             int match=matchingTab(actual.get());
             if (match>=0 && match!=active) {
@@ -640,7 +658,18 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 else moveTabToEnd(match,tracked);
                 return;
             }
-            if (active<0) append(std::move(actual));
+            if (ctrlOpen && active>=0 && match<0) {
+                if (hasRoom() && append(std::move(actual))>=0) return;
+                // The native command has already navigated. At capacity return to
+                // the source tab using the same confirmation as an ordinary switch.
+                destination=active;
+                deadline=GetTickCount64()+15000;
+                schedule(25);
+                Location source(ILCloneFull(folders[active].folder.get()));
+                if (!source || FAILED(browser->BrowseObject(source.get(),SBSP_ABSOLUTE|SBSP_SAMEBROWSER)))
+                    destination=-1;
+                controls();
+            } else if (active<0) append(std::move(actual));
             else {
                 folders[active].folder = std::move(actual);
                 label(active, false);
@@ -651,6 +680,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         nextImported = -1;
         if (destination >= 0 || index < 0 || index >= static_cast<int>(folders.size())) return;
         if (pendingNew<0 && !removePrevious && !closeTarget) sync(&index);
+        nativeCtrlDeadline=0;
         if ((!closeTarget && index == active) || (active < 0 && !nativeLocation)) return;
         closingTo=std::move(closeTarget);
         destination = index;
@@ -1133,27 +1163,104 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         } else return false;
         return true;
     }
-    // Explorer handles the native selection first. Only the focused list item at
-    // the actual click point may open, never a previous selection on blank space.
-    void openCtrlClickedFolder(POINT point) {
+    static bool classIs(HWND w,const wchar_t* type) {
+        wchar_t name[64]{};
+        return GetClassNameW(w,name,ARRAYSIZE(name)) && !wcscmp(name,type);
+    }
+    static Location directoryId(IShellItem* item) {
+        SFGAOF attrs=0;
+        PIDLIST_ABSOLUTE raw=nullptr;
+        if (item && SUCCEEDED(item->GetAttributes(SFGAO_FOLDER|SFGAO_STREAM,&attrs)) &&
+            (attrs&(SFGAO_FOLDER|SFGAO_STREAM))==SFGAO_FOLDER) SHGetIDListFromObject(item,&raw);
+        return Location(raw);
+    }
+    Location treeFolder(HWND w,const POINT* screen) {
+        if (!classIs(w,WC_TREEVIEWW)) return {};
+        Com<IServiceProvider> services;
+        Com<INameSpaceTreeControl> tree;
+        if (!browser.p || FAILED(browser->QueryInterface(IID_PPV_ARGS(&services.p))) ||
+            FAILED(services->QueryService(SID_SNavigationPane,IID_PPV_ARGS(&tree.p)))) return {};
+        Com<IShellItem> item;
+        if (screen) {
+            TVHITTESTINFO hit{};
+            hit.pt=*screen; ScreenToClient(w,&hit.pt);
+            if (!TreeView_HitTest(w,&hit) || !(hit.flags&(TVHT_ONITEMLABEL|TVHT_ONITEMICON))) return {};
+            Com<IOleWindow> control;
+            HWND treeWindow=nullptr;
+            if (FAILED(tree->QueryInterface(IID_PPV_ARGS(&control.p))) ||
+                FAILED(control->GetWindow(&treeWindow)) || (treeWindow!=w && !IsChild(treeWindow,w))) return {};
+            POINT pt=*screen;
+            ScreenToClient(treeWindow,&pt);
+            tree->HitTest(&pt,&item.p);
+        } else {
+            Com<IShellItemArray> selected;
+            if (SUCCEEDED(tree->GetSelectedItems(&selected.p)) && selected.p) selected->GetItemAt(0,&item.p);
+        }
+        return directoryId(item.p);
+    }
+    Location enterFolder(HWND focus) {
+        if (classIs(focus,WC_TREEVIEWW)) return treeFolder(focus,nullptr);
+        Com<IShellView> view;
+        HWND content=nullptr;
+        if (!browser.p || FAILED(browser->QueryActiveShellView(&view.p)) || !view.p ||
+            FAILED(view->GetWindow(&content))) return {};
+        Com<IShellItem> item;
+        if (focus==content || IsChild(content,focus)) {
+            if (classIs(focus,L"Edit")) return {};
+            Com<IFolderView2> folder;
+            int index=-1;
+            if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&folder.p))) && SUCCEEDED(folder->GetFocusedItem(&index)) && index>=0)
+                folder->GetItem(index,IID_PPV_ARGS(&item.p));
+        }
+        return directoryId(item.p);
+    }
+    bool folderSurface(HWND w) {
+        if (!w) return false;
+        if (classIs(w,WC_TREEVIEWW)) return true;
+        Com<IShellView> view;
+        HWND content=nullptr;
+        return browser.p && SUCCEEDED(browser->QueryActiveShellView(&view.p)) && view.p &&
+               SUCCEEDED(view->GetWindow(&content)) && content && (content==w || IsChild(content,w));
+    }
+    void openLocalFolder(Location id) {
+        if (!id || !IsWindowVisible(bar) || destination>=0 || incoming || separating>=0 || queuedTab>=0) return;
+        int target=tabForOpen(id);
+        if (target>=0) select(moveTabToEnd(target));
+    }
+    static Band* inputBand(HWND w,bool requireForeground=true) {
+        HWND root=GetAncestor(w,GA_ROOT);
+        if ((requireForeground && root!=GetForegroundWindow()) || !IsWindowEnabled(root)) return nullptr;
+        HWND band=static_cast<HWND>(GetPropW(root,merge::bandProp));
+        if (!band || !IsWindowVisible(band)) return nullptr;
+        for (auto* self=threadBands;self;self=self->nextOnThread)
+            if (self->bar==band) return self;
+        return nullptr;
+    }
+    void trackNativeOpen() {
+        // The shell resolves native Open commands. Adopt their navigation only
+        // if this frame actually changes folder before the next gesture.
+        if (active<0 || destination>=0 || incoming || separating>=0 || queuedTab>=0) return;
+        sync();
+        nativeCtrlDeadline=GetTickCount64()+15000;
+    }
+    // Only open the shell item under the pointer, even in full-row Details view.
+    Location contentFolderAt(POINT point,bool* inView=nullptr) {
         if (!IsWindowVisible(bar) || destination>=0 || incoming || separating>=0 || queuedTab>=0 ||
-            !(settings::load().options & settings::ctrlClick)) return;
+            !(settings::load().options & settings::ctrlClick)) return {};
         Com<IShellView> view;
         Com<IFolderView2> folder;
         HWND content=nullptr, hit=WindowFromPoint(point);
         if (!browser.p || FAILED(browser->QueryActiveShellView(&view.p)) || !view.p ||
             FAILED(view->GetWindow(&content)) || !content || (hit!=content && !IsChild(content,hit)) ||
-            FAILED(view->QueryInterface(IID_PPV_ARGS(&folder.p)))) return;
+            FAILED(view->QueryInterface(IID_PPV_ARGS(&folder.p)))) return {};
+        if (inView) *inView=true;
         int index=-1;
         Com<IShellItem> item;
-        SFGAOF attributes=0;
         if (FAILED(folder->GetFocusedItem(&index)) || index<0 ||
-            FAILED(folder->GetItem(index,IID_PPV_ARGS(&item.p))) ||
-            FAILED(item->GetAttributes(SFGAO_FOLDER|SFGAO_STREAM,&attributes)) ||
-            (attributes&(SFGAO_FOLDER|SFGAO_STREAM))!=SFGAO_FOLDER) return;
+            FAILED(folder->GetItem(index,IID_PPV_ARGS(&item.p)))) return {};
         Com<IAccessible> accessible;
         VARIANT child{};
-        if (FAILED(AccessibleObjectFromPoint(point,&accessible.p,&child))) return;
+        if (FAILED(AccessibleObjectFromPoint(point,&accessible.p,&child))) return {};
         bool focused=false;
         for (int depth=0;accessible.p && depth<8;++depth) {
             VARIANT role{},state{};
@@ -1165,6 +1272,17 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 accessible->get_accState(child,&state);
                 focused=state.vt==VT_I4 && (state.lVal&STATE_SYSTEM_FOCUSED);
                 VariantClear(&state);
+                // In Details view a cell can own accessibility focus while
+                // Explorer's focused shell item is still its parent row.
+                if (!focused) {
+                    BSTR rowName=nullptr;
+                    PWSTR itemName=nullptr;
+                    if (SUCCEEDED(accessible->get_accName(child,&rowName)) && rowName &&
+                        SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY,&itemName)) && itemName)
+                        focused=!wcscmp(rowName,itemName);
+                    SysFreeString(rowName);
+                    CoTaskMemFree(itemName);
+                }
                 break;
             }
             if (container) break;
@@ -1175,56 +1293,193 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             parent->QueryInterface(IID_PPV_ARGS(&accessible.p));
         }
         VariantClear(&child);
-        PIDLIST_ABSOLUTE raw=nullptr;
-        if (!focused || FAILED(SHGetIDListFromObject(item.p,&raw))) return;
-        Location id(raw);
-        int target=tabForOpen(id);
-        if (target>=0) select(moveTabToEnd(target));
+        return focused ? directoryId(item.p) : Location{};
     }
-    // Explorer translates Ctrl+W before dispatching to the folder view. Resolve
-    // the owning band from the actual message window, even on a shared UI thread.
+    void finishCtrlClick(POINT pt) {
+        KillTimer(bar,ctrlReleaseTimer);
+        if (ctrlPressedFolder) {
+            ctrlOpenTarget=std::move(ctrlPressedFolder);
+            PostMessageW(bar,ctrlOpenMessage,0,0);
+        } else PostMessageW(bar,ctrlClickMessage,0,MAKELPARAM(pt.x,pt.y));
+    }
+    static bool withinClick(POINT pt) {
+        return abs(pt.x-ctrlDownPoint.x)<GetSystemMetrics(SM_CXDRAG) &&
+               abs(pt.y-ctrlDownPoint.y)<GetSystemMetrics(SM_CYDRAG);
+    }
+    void checkCtrlRelease() {
+        POINT pt{};
+        if (ctrlDownWindow && inputBand(ctrlDownWindow)==this && GetCursorPos(&pt) && withinClick(pt)) {
+            if (GetAsyncKeyState(VK_LBUTTON)>=0) {
+                ctrlDownWindow=nullptr;
+                finishCtrlClick(pt);
+                return;
+            }
+            if (GetAsyncKeyState(VK_CONTROL)<0) return;
+        }
+        KillTimer(bar,ctrlReleaseTimer);
+        ctrlPressedFolder.reset();
+        if (ctrlDownWindow && GetAncestor(ctrlDownWindow,GA_ROOT)==merge::frame(bar)) ctrlDownWindow=nullptr;
+    }
+    void localInput(MSG& msg) {
+        bool mouseDown=msg.message==WM_LBUTTONDOWN || msg.message==WM_LBUTTONDBLCLK;
+        if (msg.message==WM_RBUTTONDOWN || ((msg.message==WM_KEYDOWN || msg.message==WM_SYSKEYDOWN) &&
+            (msg.wParam==VK_APPS || (msg.wParam==VK_F10 && GetKeyState(VK_SHIFT)<0)))) {
+            contextSurface=folderSurface(msg.hwnd) ? msg.hwnd : nullptr;
+            menuBand=contextSurface ? this : nullptr;
+            contextPoint=msg.pt;
+            keyboardMenu=msg.message!=WM_RBUTTONDOWN;
+            return;
+        }
+        if (mouseDown || (msg.message==WM_KEYDOWN && msg.wParam!=VK_CONTROL)) menuBand=nullptr;
+        if (mouseDown || (msg.message==WM_KEYDOWN && msg.wParam!=VK_CONTROL)) {
+            if (nativeCtrlDeadline) { sync(); nativeCtrlDeadline=0; }
+        }
+        if (mouseDown) {
+            KillTimer(bar,ctrlReleaseTimer);
+            ctrlPressedFolder.reset();
+            HWND previousClick=firstClickWindow;
+            firstClickWindow=nullptr;
+            if ((msg.wParam&(MK_CONTROL|MK_SHIFT))!=MK_CONTROL || GetKeyState(VK_MENU)<0 ||
+                !(settings::load().options&settings::ctrlClick)) return;
+            bool tree=classIs(msg.hwnd,WC_TREEVIEWW);
+            if (tree) {
+                // Let Explorer resolve pinned and virtual tree nodes to the
+                // directory it displays. Do not navigate to the tree alias again.
+                if (treeFolder(msg.hwnd,&msg.pt)) trackNativeOpen();
+                return;
+            }
+            SHELLFLAGSTATE flags{};
+            SHGetSettings(&flags,SSF_DOUBLECLICKINWEBVIEW);
+            if (flags.fDoubleClickInWebView && msg.message!=WM_LBUTTONDBLCLK &&
+                !(previousClick==msg.hwnd && msg.time-firstClickTime<=GetDoubleClickTime() &&
+                  abs(msg.pt.x-firstClickPoint.x)<=GetSystemMetrics(SM_CXDOUBLECLK)/2 &&
+                  abs(msg.pt.y-firstClickPoint.y)<=GetSystemMetrics(SM_CYDOUBLECLK)/2)) {
+                // Some shell views interpret two ordinary down messages themselves.
+                firstClickWindow=msg.hwnd;
+                firstClickPoint=msg.pt;
+                firstClickTime=msg.time;
+                return;
+            }
+            bool inView=false;
+            ctrlPressedFolder=contentFolderAt(msg.pt,&inView);
+            if (!inView) return;
+            if (flags.fDoubleClickInWebView && ctrlPressedFolder) {
+                ctrlOpenTarget=std::move(ctrlPressedFolder);
+                msg.hwnd=bar;
+                msg.message=ctrlOpenMessage;
+                return;
+            }
+            ctrlDownWindow=msg.hwnd;
+            ctrlDownPoint=msg.pt;
+            // Explorer can consume the release inside its native drag detection.
+            // Watch only this press and stop as soon as it ends or becomes a drag.
+            SetTimer(bar,ctrlReleaseTimer,30,nullptr);
+            if (ctrlPressedFolder) trackNativeOpen();
+            return;
+        }
+        if (msg.message==WM_LBUTTONUP) {
+            finishCtrlClick(msg.pt);
+            return;
+        }
+        int action=shortcutFor(msg.wParam);
+        bool windowShortcut=action==settings::Close || action==settings::Restore;
+        if (windowShortcut || (action>=0 && (msg.hwnd==tabs || msg.hwnd==add))) {
+            bool repeat=windowShortcut && (msg.lParam & (1L<<30));
+            msg.hwnd=bar;
+            msg.message=repeat ? WM_NULL : shortcutMessage;
+            msg.wParam=action;
+        } else if (msg.wParam==VK_RETURN && GetKeyState(VK_CONTROL)<0 && GetKeyState(VK_MENU)>=0 &&
+                   GetKeyState(VK_SHIFT)>=0 && (settings::load().options&settings::ctrlClick)) {
+            auto target=enterFolder(msg.hwnd);
+            if (target) {
+                ctrlOpenTarget=std::move(target);
+                msg.hwnd=bar;
+                msg.message=ctrlOpenMessage;
+            }
+        }
+    }
+    // Observe only input removed from this Explorer UI thread's queue.
     static LRESULT CALLBACK focusedMessage(int code,WPARAM mode,LPARAM data) {
         if (code==HC_ACTION && mode==PM_REMOVE) {
-            auto* msg=reinterpret_cast<MSG*>(data);
-            if (msg->message==WM_LBUTTONDOWN) {
-                ctrlDownWindow=nullptr;
-                if ((msg->wParam&(MK_CONTROL|MK_SHIFT))==MK_CONTROL && GetKeyState(VK_MENU)>=0) {
-                    ctrlDownWindow=msg->hwnd;
-                    ctrlDownPoint=msg->pt;
-                }
-            } else if (ctrlDownWindow && (msg->message==WM_MOUSEMOVE || msg->message==WM_LBUTTONUP)) {
-                if (!(msg->wParam&MK_CONTROL) || msg->wParam&MK_SHIFT ||
-                    abs(msg->pt.x-ctrlDownPoint.x)>=GetSystemMetrics(SM_CXDRAG) ||
-                    abs(msg->pt.y-ctrlDownPoint.y)>=GetSystemMetrics(SM_CYDRAG)) ctrlDownWindow=nullptr;
-                if (msg->message==WM_LBUTTONUP) {
-                    if (ctrlDownWindow==msg->hwnd && GetKeyState(VK_MENU)>=0) {
-                        HWND root=GetAncestor(msg->hwnd,GA_ROOT);
-                        HWND band=static_cast<HWND>(GetPropW(root,merge::bandProp));
-                        if (band && IsWindowVisible(band) && root==GetForegroundWindow())
-                            PostMessageW(band,ctrlClickMessage,0,MAKELPARAM(msg->pt.x,msg->pt.y));
-                    }
-                    ctrlDownWindow=nullptr;
-                }
-            }
-            if ((msg->message==WM_KEYDOWN || msg->message==WM_SYSKEYDOWN) && msg->hwnd && msg->hwnd==GetFocus()) {
-                HWND root = GetAncestor(msg->hwnd,GA_ROOT);
-                HWND band = static_cast<HWND>(GetPropW(root,merge::bandProp));
-                if (root==GetForegroundWindow() && band && IsWindowVisible(band) && IsWindowEnabled(root)) {
-                    auto* self = threadBands;
-                    while (self && self->bar != band) self = self->nextOnThread;
-                    if (!self) return CallNextHookEx(nullptr,code,mode,data);
-                    int action = self->shortcutFor(msg->wParam);
-                    bool windowShortcut=action==settings::Close || action==settings::Restore;
-                    if (windowShortcut || (action>=0 && (msg->hwnd==self->tabs || msg->hwnd==self->add))) {
-                        bool repeat = windowShortcut && (msg->lParam & (1L<<30));
-                        msg->hwnd=band;
-                        msg->message=repeat ? WM_NULL : shortcutMessage;
-                        msg->wParam=action;
-                    }
+            auto& msg=*reinterpret_cast<MSG*>(data);
+            bool down=msg.message==WM_LBUTTONDOWN || msg.message==WM_LBUTTONDBLCLK;
+            if (down) ctrlDownWindow=nullptr;
+            if (ctrlDownWindow && (msg.message==WM_MOUSEMOVE || msg.message==WM_LBUTTONUP) &&
+                (!withinClick(msg.pt) || (msg.wParam&MK_SHIFT) || GetKeyState(VK_MENU)<0 ||
+                 (!(msg.wParam&MK_CONTROL) && (msg.message==WM_LBUTTONUP || (msg.wParam&MK_LBUTTON))))) ctrlDownWindow=nullptr;
+            bool up=msg.message==WM_LBUTTONUP && ctrlDownWindow &&
+                GetAncestor(msg.hwnd,GA_ROOT)==GetAncestor(ctrlDownWindow,GA_ROOT);
+            if (msg.message==WM_LBUTTONUP) ctrlDownWindow=nullptr;
+            bool key=(msg.message==WM_KEYDOWN || msg.message==WM_SYSKEYDOWN) && msg.hwnd==GetFocus();
+            if (down || up || key || msg.message==WM_RBUTTONDOWN) {
+                if (auto* self=inputBand(msg.hwnd,msg.message!=WM_RBUTTONDOWN)) {
+                    Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                    try { self->localInput(msg); } catch (const std::bad_alloc&) { MessageBeep(MB_ICONWARNING); }
                 }
             }
         }
         return CallNextHookEx(nullptr,code,mode,data);
+    }
+    static bool isShellOpenCommand(PCIDLIST_ABSOLUTE id,LPCWSTR title) {
+        Com<IShellFolder> parent;
+        PCUITEMID_CHILD child=nullptr;
+        Com<IContextMenu> commands;
+        if (FAILED(SHBindToParent(id,IID_PPV_ARGS(&parent.p),&child)) ||
+            FAILED(parent->GetUIObjectOf(nullptr,1,&child,IID_IContextMenu,nullptr,reinterpret_cast<void**>(&commands.p)))) return false;
+        HMENU menu=CreatePopupMenu();
+        if (!menu) return false;
+        bool match=false;
+        if (SUCCEEDED(commands->QueryContextMenu(menu,0,1,0x7fff,CMF_NORMAL))) {
+            for (int i=0;i<GetMenuItemCount(menu);++i) {
+                wchar_t name[128]{},verb[128]{};
+                UINT command=GetMenuItemID(menu,i);
+                if (!command || command>0x7fff || !GetMenuStringW(menu,i,name,ARRAYSIZE(name),MF_BYPOSITION) ||
+                    wcscmp(name,title) || FAILED(commands->GetCommandString(command-1,GCS_VERBW,nullptr,
+                    reinterpret_cast<LPSTR>(verb),ARRAYSIZE(verb)))) continue;
+                match=!_wcsicmp(verb,L"open") || !_wcsicmp(verb,L"explore") || !_wcsicmp(verb,L"EZFolder.Open");
+                if (match) break;
+            }
+        }
+        DestroyMenu(menu);
+        return match;
+    }
+    bool openFromMenu(const MSG& msg) {
+        if (!contextSurface || !(settings::load().options&settings::ctrlClick)) return false;
+        bool key=msg.message==WM_KEYDOWN;
+        HWND popup=key ? GetTopWindow(nullptr) : WindowFromPoint(msg.pt);
+        for (;popup;popup=key ? ::GetWindow(popup,GW_HWNDNEXT) : nullptr) {
+            if (!classIs(popup,L"#32768") || !IsWindowVisible(popup) ||
+                GetWindowThreadProcessId(popup,nullptr)!=GetCurrentThreadId()) continue;
+            HMENU menu=reinterpret_cast<HMENU>(SendMessageW(popup,MN_GETHMENU,0,0));
+            int pos=key ? -1 : MenuItemFromPoint(nullptr,menu,msg.pt);
+            if (key) for (int i=0;i<GetMenuItemCount(menu);++i) {
+                if (GetMenuState(menu,i,MF_BYPOSITION)&MF_HILITE) { pos=i; break; }
+            }
+            wchar_t title[128]{};
+            if (pos<0 || !GetMenuStringW(menu,pos,title,ARRAYSIZE(title),MF_BYPOSITION)) continue;
+            Location folder=!keyboardMenu && classIs(contextSurface,WC_TREEVIEWW) ?
+                treeFolder(contextSurface,&contextPoint) : enterFolder(contextSurface);
+            if (!folder || !isShellOpenCommand(folder.get(),title)) return false;
+            if (!EndMenu()) return false;
+            menuBand=nullptr;
+            ctrlOpenTarget=std::move(folder);
+            PostMessageW(bar,ctrlOpenMessage,0,0);
+            return true;
+        }
+        return false;
+    }
+    static LRESULT CALLBACK menuInput(int code,WPARAM wp,LPARAM lp) {
+        if (code==MSGF_MENU && GetKeyState(VK_CONTROL)<0 && GetKeyState(VK_MENU)>=0 && GetKeyState(VK_SHIFT)>=0) {
+            const auto& msg=*reinterpret_cast<const MSG*>(lp);
+            if (msg.message==WM_LBUTTONDOWN || (msg.message==WM_KEYDOWN && msg.wParam==VK_RETURN)) {
+                auto* self=menuBand;
+                if (self && IsWindowVisible(self->bar)) {
+                    Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                    try { if (self->openFromMenu(msg)) return 1; } catch (const std::bad_alloc&) { }
+                }
+            }
+        }
+        return CallNextHookEx(nullptr,code,wp,lp);
     }
     static LRESULT CALLBACK childProc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
         auto* self = reinterpret_cast<Band*>(data);
@@ -1305,9 +1560,17 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 Com<IDeskBand> guard; self->AddRef(); guard.p=self;
                 self->tabMenu(p); return 0;
             }
+            if (msg==ctrlOpenMessage) {
+                Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                self->openLocalFolder(std::move(self->ctrlOpenTarget)); return 0;
+            }
+            if (msg==WM_TIMER && wp==ctrlReleaseTimer) {
+                Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                self->checkCtrlRelease(); return 0;
+            }
             if (msg==ctrlClickMessage) {
                 Com<IDeskBand> guard; self->AddRef(); guard.p=self;
-                self->openCtrlClickedFolder({short(LOWORD(lp)),short(HIWORD(lp))});
+                self->openLocalFolder(self->contentFolderAt({short(LOWORD(lp)),short(HIWORD(lp))}));
                 return 0;
             }
             if (msg==navigateMessage) {
@@ -1430,7 +1693,10 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (root) SetPropW(root, merge::bandProp, bar);
         if (root) {
             if (!threadKeys) threadKeys=SetWindowsHookExW(WH_GETMESSAGE,focusedMessage,nullptr,GetCurrentThreadId());
-            if (threadKeys) { nextOnThread=threadBands; threadBands=this; watchingKeys=true; }
+            if (threadKeys) {
+                if (!threadMenus) threadMenus=SetWindowsHookExW(WH_MSGFILTER,menuInput,nullptr,GetCurrentThreadId());
+                nextOnThread=threadBands; threadBands=this; watchingKeys=true;
+            }
         }
         if (!settled) {
             if (HWND candidate = merge::target(bar,true)) presentation.begin(root,candidate);
@@ -1478,12 +1744,16 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         restoring=rememberRemoval=false;
         queuedTab=-1;
         if (watchingKeys) {
+            if (menuBand==this) menuBand=nullptr;
             watchingKeys=false;
             auto** link=&threadBands;
             while (*link != this) link=&(*link)->nextOnThread;
             *link=nextOnThread;
             nextOnThread=nullptr;
-            if (!threadBands) { UnhookWindowsHookEx(threadKeys); threadKeys=nullptr; }
+            if (!threadBands) {
+                UnhookWindowsHookEx(threadKeys); threadKeys=nullptr;
+                if (threadMenus) { UnhookWindowsHookEx(threadMenus); threadMenus=nullptr; }
+            }
         }
         settle();
         presentation.finish();
@@ -1501,6 +1771,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         if (font) { DeleteObject(font); font = nullptr; }
         folders.clear();
         nativeLocation.reset();
+        ctrlPressedFolder.reset();
+        nativeCtrlDeadline=0;
+        ctrlOpenTarget.reset();
         closingTo.reset();
         active = destination = pendingNew = pressedTab = separating = -1;
         independent = nullptr;
@@ -1544,7 +1817,7 @@ public:
     STDMETHODIMP ContextSensitiveHelp(BOOL) override { return E_NOTIMPL; }
     STDMETHODIMP ShowDW(BOOL show) override {
         if (bar) {
-            if (!show) { hideTitle(); if (!closingMergedFrame) presentation.finish(); }
+            if (!show) { nativeCtrlDeadline=0; hideTitle(); if (!closingMergedFrame) presentation.finish(); }
             ShowWindow(bar, show ? SW_SHOWNA : SW_HIDE);
             if (show) PostMessageW(bar, refreshMessage, 0, 0);
         }
