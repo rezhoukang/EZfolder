@@ -4,7 +4,7 @@
     <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <StackPanel>
-        <TextBlock Text="新标签页" Style="{StaticResource TitleTextBlockStyle}" />
+        <TextBlock Text="新标签页" Style="{StaticResource SubtitleTextBlockStyle}" />
         <TextBlock Text="默认打开位置" Style="{StaticResource BodyTextBlockStyle}" Margin="0,20,0,4" />
         <RadioButton x:Name="ThisPC" Content="此电脑" GroupName="Location" />
         <RadioButton x:Name="QuickAccess" Content="快速访问" GroupName="Location" />

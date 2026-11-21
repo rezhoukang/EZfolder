@@ -19,7 +19,7 @@ interface IXamlSourceNative2 {
     void PreTranslateMessage(ref SettingsWindow.NativeMessage msg, [MarshalAs(UnmanagedType.Bool)] out bool handled);
 }
 
-sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
+sealed class SettingsWindow : SettingsFrame, Forms.IMessageFilter {
     [StructLayout(LayoutKind.Sequential)]
     public struct NativeMessage {
         public IntPtr hwnd;
@@ -39,10 +39,6 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
     readonly ShortcutEditor editor = new ShortcutEditor();
 
     public SettingsWindow(IntPtr owner) {
-        Text = "EZFolder 设置";
-        FormBorderStyle = Forms.FormBorderStyle.FixedDialog;
-        MaximizeBox = MinimizeBox = false;
-        ShowIcon = false;
         StartPosition = Forms.FormStartPosition.Manual;
         Rectangle work = Forms.Screen.FromHandle(owner).WorkingArea;
         Location = work.Location;
@@ -50,6 +46,7 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         native = (IXamlSourceNative2)(object)source;
         native.AttachToWindow(Handle);
         island = native.GetWindowHandle();
+        CaptionResized+=delegate { ResizePage(); };
         using (var reader = new StreamReader(Assembly.GetExecutingAssembly().GetManifestResourceStream("settings.xaml")))
             page = (Controls.Grid)XamlReader.Load(reader.ReadToEnd());
         source.Content = page;
@@ -69,8 +66,8 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
             var row=new Controls.Grid { Margin=new Thickness(0,2,0,2) };
             row.ColumnDefinitions.Add(new Controls.ColumnDefinition());
             row.ColumnDefinitions.Add(new Controls.ColumnDefinition { Width=GridLength.Auto });
-            row.Children.Add(new Controls.TextBlock {Text=ShortcutEditor.Names[i],VerticalAlignment=VerticalAlignment.Center});
-            var button=new Controls.Button { MinWidth=156,HorizontalAlignment=HorizontalAlignment.Stretch };
+            row.Children.Add(new Controls.TextBlock {Text=ShortcutEditor.Names[i],FontSize=pc.FontSize,VerticalAlignment=VerticalAlignment.Center});
+            var button=new Controls.Button { FontSize=pc.FontSize,MinWidth=156,HorizontalAlignment=HorizontalAlignment.Stretch };
             Windows.UI.Xaml.Automation.AutomationProperties.SetAutomationId(button,"Binding"+i);
             button.Click+=delegate { editor.Begin(index); };
             button.LostFocus+=delegate { if (editor.Recording==index) editor.CancelCapture(); };
@@ -97,13 +94,14 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         Forms.Application.AddMessageFilter(this);
         using (var graphics = CreateGraphics())
             ClientSize = new Size(Math.Min(work.Width-20,(int)Math.Ceiling(416*graphics.DpiX/96)),
-                Math.Min(work.Height-64,(int)Math.Ceiling(606*graphics.DpiY/96)));
+                Math.Min(work.Height-64,CaptionHeight+(int)Math.Ceiling(606*graphics.DpiY/96)));
         Location = new Point(work.Left+(work.Width-Width)/2, work.Top+(work.Height-Height)/2);
         Shown += delegate { (quick.IsChecked == true ? quick : pc).Focus(FocusState.Programmatic); };
     }
     void ApplyTheme() {
         var bg = system.GetColorValue(UIColorType.Background);
         int dark = bg.R+bg.G+bg.B < 384 ? 1 : 0;
+        ApplyCaptionTheme(dark!=0);
         page.RequestedTheme = dark != 0 ? ElementTheme.Dark : ElementTheme.Light;
         BackColor = Color.FromArgb(bg.R,bg.G,bg.B);
         if (DwmSetWindowAttribute(Handle,20,ref dark,sizeof(int)) < 0)
@@ -114,7 +112,10 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
     }
     protected override void OnResize(EventArgs e) {
         base.OnResize(e);
-        if (island != IntPtr.Zero) SetWindowPos(island,IntPtr.Zero,0,0,ClientSize.Width,ClientSize.Height,0x40|0x10);
+        ResizePage();
+    }
+    void ResizePage() {
+        if (island != IntPtr.Zero) SetWindowPos(island,IntPtr.Zero,0,CaptionHeight,ClientSize.Width,Math.Max(0,ClientSize.Height-CaptionHeight),0x40|0x10);
     }
     public bool PreFilterMessage(ref Forms.Message m) {
         if (m.Msg < 0x100 || m.Msg > 0x109) return false;
@@ -147,11 +148,11 @@ static class SettingsProgram {
     }
     // Windows 10 before 1903 does not host XAML Islands. Keep the same preference accessible.
     static void RunClassic() {
-        Forms.Application.EnableVisualStyles();
-        using (var form = new Forms.Form { Text="EZFolder 设置", FormBorderStyle=Forms.FormBorderStyle.FixedDialog,
-            Font=SystemFonts.MessageBoxFont, MaximizeBox=false, MinimizeBox=false, AutoSize=true,
+        using (var form = new SettingsFrame { Font=SystemFonts.MessageBoxFont, AutoSize=true,
             AutoSizeMode=Forms.AutoSizeMode.GrowAndShrink, StartPosition=Forms.FormStartPosition.CenterScreen }) {
             var content=new Forms.FlowLayoutPanel { AutoSize=true, FlowDirection=Forms.FlowDirection.TopDown, Padding=new Forms.Padding(16) };
+            content.Top=form.CaptionHeight;
+            form.CaptionResized+=delegate { content.Top=form.CaptionHeight; };
             var editor=new ShortcutEditor();
             var pc=new Forms.RadioButton { Text="此电脑",AutoSize=true };
             var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=editor.QuickAccess };
@@ -194,6 +195,7 @@ static class SettingsProgram {
         try {
             long owner;
             if (args.Length != 1 || !long.TryParse(args[0],out owner)) return 1;
+            Forms.Application.EnableVisualStyles();
             if (ApiInformation.IsApiContractPresent("Windows.Foundation.UniversalApiContract",8)) RunIsland(new IntPtr(owner));
             else RunClassic();
             return 0;
