@@ -10,6 +10,7 @@ sealed class ShortcutEditor : Forms.IMessageFilter {
     public static readonly string[] Names = {"新建标签页","关闭当前标签","下一个标签","上一个标签","恢复上个关闭的标签页"};
     readonly int[] shortcuts = (int[])Defaults.Clone();
     public bool QuickAccess;
+    public bool ShowClose=true, CtrlClick=true;
     public int Recording { get; private set; }
     public string HintText { get; private set; }
     public event Action Changed;
@@ -20,17 +21,23 @@ sealed class ShortcutEditor : Forms.IMessageFilter {
         using (var key=Registry.CurrentUser.OpenSubKey(RegistryPath)) {
             if (key==null) return;
             var data=key.GetValue("PreferencesV1") as byte[];
-            if (data!=null && (data.Length==20 || data.Length==(shortcuts.Length+1)*4) && (uint)BitConverter.ToInt32(data,0)<=1) {
+            if (data!=null && (data.Length==20 || data.Length==24 || data.Length==28) && (uint)BitConverter.ToInt32(data,0)<=1) {
                 QuickAccess=BitConverter.ToInt32(data,0)==1;
-                Buffer.BlockCopy(data,4,shortcuts,0,data.Length-4);
+                Buffer.BlockCopy(data,4,shortcuts,0,Math.Min(data.Length-4,shortcuts.Length*4));
+                if (data.Length==28) {
+                    int options=BitConverter.ToInt32(data,24);
+                    ShowClose=(options&1)!=0;
+                    CtrlClick=(options&2)!=0;
+                }
                 if (data.Length==20 && Array.IndexOf(shortcuts,shortcuts[4],0,4)>=0) shortcuts[4]=0;
             } else QuickAccess=object.Equals(key.GetValue("NewTabLocation"),1);
         }
     }
-    public bool Save(Forms.Form owner,bool quick) {
-        var data=new byte[(shortcuts.Length+1)*4];
+    public bool Save(Forms.Form owner,bool quick,bool showClose,bool ctrlClick) {
+        var data=new byte[(shortcuts.Length+2)*4];
         data[0]=(byte)(quick ? 1 : 0);
         Buffer.BlockCopy(shortcuts,0,data,4,shortcuts.Length*4);
+        data[data.Length-4]=(byte)((showClose ? 1 : 0)|(ctrlClick ? 2 : 0));
         try {
             using (var key=Registry.CurrentUser.CreateSubKey(RegistryPath))
                 key.SetValue("PreferencesV1",data,RegistryValueKind.Binary);

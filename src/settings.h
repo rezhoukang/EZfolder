@@ -3,17 +3,19 @@ namespace settings {
 constexpr wchar_t key[] = L"Software\\EZFolder";
 enum Action { New, Close, Next, Previous, Restore, ActionCount };
 constexpr DWORD control = 0x100, shift = 0x200, alt = 0x400;
+constexpr DWORD showClose = 1, ctrlClick = 2;
 struct Preferences {
     DWORD quick = 0;
     DWORD shortcuts[ActionCount] = {control|'T',control|'W',control|VK_TAB,control|shift|VK_TAB,control|shift|'T'};
+    DWORD options = showClose | ctrlClick;
 };
 inline Preferences load() {
     Preferences prefs;
     DWORD size = sizeof(prefs);
     if (RegGetValueW(HKEY_CURRENT_USER,key,L"PreferencesV1",RRF_RT_REG_BINARY,nullptr,&prefs,&size) == ERROR_SUCCESS &&
         prefs.quick <= 1) {
-        if (size == sizeof(prefs)) return prefs;
-        if (size == sizeof(prefs)-sizeof(DWORD)) {
+        if (size == sizeof(prefs) || size == offsetof(Preferences,options)) return prefs;
+        if (size == offsetof(Preferences,options)-sizeof(DWORD)) {
             prefs.shortcuts[Restore]=Preferences{}.shortcuts[Restore];
             for (int i=0;i<Restore;++i)
                 if (prefs.shortcuts[i]==prefs.shortcuts[Restore]) prefs.shortcuts[Restore]=0;

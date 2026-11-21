@@ -151,19 +151,29 @@ public static class RibbonEntryTest {
             System.Threading.Thread.Sleep(40);
         }
     }
+    public static void CtrlClick(IntPtr root,Point point) {
+        if(GetAncestor(WindowFromPoint(point),2)!=root) throw new Exception("Folder item is covered.");
+        SetCursorPos(point.X,point.Y);
+        keybd_event(17,0,0,UIntPtr.Zero);
+        try {
+            mouse_event(2,0,0,0,UIntPtr.Zero);
+            System.Threading.Thread.Sleep(60);
+            mouse_event(4,0,0,0,UIntPtr.Zero);
+        } finally { keybd_event(17,0,2,UIntPtr.Zero); }
+    }
     public static void Menu(IntPtr w) { PostMessage(w,0x7b,w,new IntPtr(-1)); }
     public static void Mouse(IntPtr w,int message,int x,int y) {
         IntPtr result;
         if(SendMessageTimeout(w,message,(IntPtr)(message==0x201||message==0x200?1:0),(IntPtr)((y<<16)|(x&65535)),2,6000,out result)==IntPtr.Zero)
             throw new Exception("Test window did not respond to mouse input");
     }
-    public static bool DragTip(IntPtr bar) {
+    public static bool DragTip(IntPtr bar,string expected) {
         uint owner,pid; GetWindowThreadProcessId(bar,out owner);
         for(IntPtr w=FindWindowEx(IntPtr.Zero,IntPtr.Zero,"tooltips_class32",null);w!=IntPtr.Zero;w=FindWindowEx(IntPtr.Zero,w,"tooltips_class32",null)) {
             GetWindowThreadProcessId(w,out pid);
             if(pid!=owner||!IsWindowVisible(w))continue;
             var text=new StringBuilder(128);IntPtr result;
-            if(ReadText(w,13,(IntPtr)128,text,2,300,out result)!=IntPtr.Zero && text.ToString().Contains("合并"))return true;
+            if(ReadText(w,13,(IntPtr)128,text,2,300,out result)!=IntPtr.Zero && text.ToString()==expected)return true;
         }
         return false;
     }
@@ -217,13 +227,14 @@ function Test-TabActions {
         [RibbonEntryTest]::Mouse($tabs,0x202,$x,8)
         Wait-For "select tab $index" { [RibbonEntryTest]::SelectedTab($tabs) -eq $index -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
     }
-    function Open-VisibleFolder($entry) {
+    function Open-VisibleFolder($entry,[switch]$Ctrl) {
         $window.Document.SelectItem($entry,29)
         $selected=[Windows.Automation.PropertyCondition]::new([Windows.Automation.SelectionItemPattern]::IsSelectedProperty,$true)
         $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
         $item=Wait-For 'selected folder in content view' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($selected,$type)) }
         $hit=$item.GetClickablePoint()
-        [RibbonEntryTest]::OpenItem($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
+        $point=[RibbonEntryTest+Point]::new($hit.X,$hit.Y)
+        if ($Ctrl) { [RibbonEntryTest]::CtrlClick($root,$point) } else { [RibbonEntryTest]::OpenItem($root,$point) }
     }
     $other=$null
     try {
@@ -263,10 +274,27 @@ function Test-TabActions {
         [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
         Wait-For 'fixture tab preserved' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
         'PASS: reopening Pictures in This PC moves the existing disk-path tab to the right and preserves This PC.'
-        [RibbonEntryTest]::NewTab($bar)
-        Wait-For 'second tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
-        $window.Navigate2($child)
-        Wait-For 'ordinary child ready' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
+        $file=Join-Path $folder 'CtrlClick.txt'
+        [IO.File]::WriteAllText($file,'')
+        try {
+            Open-VisibleFolder ($window.Document.Folder.ParseName('CtrlClick.txt')) -Ctrl
+            Wait-For 'Ctrl-click deselects the selected ordinary file' { $window.Document.SelectedItems().Count -eq 0 } | Out-Null
+            if ([RibbonEntryTest]::TabCount($tabs) -ne 1 -or $window.Document.Folder.Self.Path -ne $folder) { throw 'Ctrl-click on a file changed tabs.' }
+        } finally { [IO.File]::Delete($file) }
+        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Moved')
+        $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
+        $row=Wait-For 'unselected folder in the source view' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($name,$type)) }
+        $hit=$row.GetClickablePoint()
+        [RibbonEntryTest]::CtrlClick($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
+        Wait-For 'Ctrl-click opens child in second tab' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) -and $window.Document.Folder.Self.Path -eq $child
+        } | Out-Null
+        'PASS: Ctrl-click opened the clicked folder in a new tab.'
+        Select-TestTab 0
+        Open-VisibleFolder ($window.Document.Folder.ParseName('Moved')) -Ctrl
+        Wait-For 'Ctrl-click reuses an existing folder tab' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $child
+        } | Out-Null
         Select-TestTab 0
         Open-VisibleFolder ($window.Document.Folder.ParseName('Moved'))
         Wait-For 'existing child selected' { $window.Document.Folder.Self.Path -eq $child -and [RibbonEntryTest]::SelectedTab($tabs) -eq 1 } | Out-Null
@@ -294,7 +322,7 @@ function Test-TabActions {
         $x=$to.Left+15-$from.Left; $y=$to.Top+8-$from.Top
         [RibbonEntryTest]::Mouse($tabs,0x201,12,8)
         [RibbonEntryTest]::Mouse($tabs,0x200,$x,$y)
-        Wait-For 'drag feedback identifies merge target' { [RibbonEntryTest]::DragTip($bar) } | Out-Null
+        Wait-For 'drag feedback shows only the tab name' { [RibbonEntryTest]::DragTip($bar,[IO.Path]::GetFileName($folder)) } | Out-Null
         [RibbonEntryTest]::Mouse($tabs,0x202,$x,$y)
         Start-Sleep -Milliseconds 250
         Wait-For 'explicit drop moves only the dragged folder' {
@@ -357,6 +385,7 @@ function Test-SettingsMenu {
     $settings = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\EZFolder')
     $prior = $settings.GetValue('NewTabLocation')
     $priorPreferences = $settings.GetValue('PreferencesV1')
+    $clickFolder=Join-Path $folder 'ClickOptions'
     $popup = [IntPtr]::Zero
     $saved = New-Object RibbonEntryTest+Point
     if (![RibbonEntryTest]::GetCursorPos([ref]$saved)) { throw 'Cannot save cursor position.' }
@@ -379,6 +408,11 @@ function Test-SettingsMenu {
             $rowRect=(SettingControl 'Binding0').Current.BoundingRectangle
             if ([Math]::Abs($resetRect.Right-$rowRect.Right) -gt 2) { throw 'Reset is not aligned to the right of the shortcut column.' }
             $reset = $action -in @('Reset','CancelReset')
+            foreach ($option in 'ShowClose','CtrlClick') {
+                $toggle=(SettingControl $option).GetCurrentPattern([Windows.Automation.TogglePattern]::Pattern)
+                if (($toggle.Current.ToggleState -eq 'On') -eq $reset) { throw "Incorrect initial $option" }
+                if (!$reset) { $toggle.Toggle() }
+            }
             $current = if ($reset) { 'QuickAccess' } else { 'ThisPC' }
             if (!(SettingControl $current).GetCurrentPattern($selection).Current.IsSelected) { throw 'Dialog did not load the saved setting.' }
             for ($k=0;$k -lt $defaultKeys.Count;$k++) {
@@ -427,7 +461,8 @@ function Test-SettingsMenu {
                     $expectedKey = if ($quick) { 0 } else { @(0x157,0x109,0x309)[$binding-1] }
                     if ([BitConverter]::ToInt32($blob,4*($binding+1)) -ne $expectedKey) { throw "Incorrect cleared/reset binding $binding." }
                 }
-                if ($blob.Length -ne 24 -or [BitConverter]::ToInt32($blob,20) -ne $restoreKey) { throw 'Incorrect saved restore binding.' }
+                if ($blob.Length -ne 28 -or [BitConverter]::ToInt32($blob,20) -ne $restoreKey) { throw 'Incorrect saved restore binding.' }
+                if ([BitConverter]::ToInt32($blob,24) -ne (3*(1-$quick))) { throw 'Incorrect saved mouse options.' }
                 if ([BitConverter]::ToInt32($blob,0) -ne $quick -or [BitConverter]::ToInt32($blob,4) -ne $newKey) { throw "Incorrect saved $action settings." }
                 if ($action -eq 'CancelReset') { continue }
                 $bar = [FixtureWindow]::GetProp($root,'EZFolder.Band.2')
@@ -438,6 +473,22 @@ function Test-SettingsMenu {
                     if ([RibbonEntryTest]::TabCount($tabs) -ne $count) { throw 'Reset left the custom hotkey active.' }
                     continue
                 }
+                [void][IO.Directory]::CreateDirectory($clickFolder)
+                [void][RibbonEntryTest]::SetForegroundWindow($root)
+                $frame=[Windows.Automation.AutomationElement]::FromHandle($root)
+                $byName=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'ClickOptions')
+                $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
+                $hit=Wait-For 'clickable folder for disabled Ctrl-click' {
+                    $child=$frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($byName,$type))
+                    if ($child) { try { $child.GetClickablePoint() } catch [System.Management.Automation.MethodInvocationException] {} }
+                }
+                [RibbonEntryTest]::CtrlClick($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
+                Wait-For 'disabled Ctrl-click selects folder' { @($window.Document.SelectedItems() | Where-Object { $_.Path -eq $clickFolder }).Count -eq 1 } | Out-Null
+                Start-Sleep -Milliseconds 1550
+                $x=[int](122*[RibbonEntryTest]::GetDpiForWindow($tabs)/96)
+                [RibbonEntryTest]::Mouse($tabs,0x201,$x,12)
+                [RibbonEntryTest]::Mouse($tabs,0x202,$x,12)
+                if ([RibbonEntryTest]::TabCount($tabs) -ne $count -or $window.Document.Folder.Self.Path -ne $folder) { throw 'Disabled click options still changed tabs.' }
                 [RibbonEntryTest]::FocusTabs($root,$tabs)
                 Wait-For 'fixture selects original folder' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
                 Wait-For 'fixture tab has keyboard focus' {
@@ -462,6 +513,7 @@ function Test-SettingsMenu {
         if ($null -eq $priorPreferences) { $settings.DeleteValue('PreferencesV1',$false) }
         else { $settings.SetValue('PreferencesV1',$priorPreferences,[Microsoft.Win32.RegistryValueKind]::Binary) }
         $settings.Dispose()
+        if ([IO.Directory]::Exists($clickFolder)) { [IO.Directory]::Delete($clickFolder) }
         [void][RibbonEntryTest]::SetCursorPos($saved.X,$saved.Y)
     }
 }

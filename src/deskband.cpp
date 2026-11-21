@@ -32,8 +32,8 @@ using Location = std::unique_ptr<ITEMIDLIST, FreePidl>;
 #include "merge_visibility.h"
 #include "window_merge.h"
 #include "desktop_open.h"
-#include "band_theme.h"
 #include "settings.h"
+#include "band_theme.h"
 
 class Band final : public IDeskBand, public IObjectWithSite, public IInputObject, public IPersistStream {
     LONG refs = 1;
@@ -76,12 +76,15 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
     static constexpr UINT separateMessage = WM_APP + 29;
     static constexpr UINT shortcutMessage = WM_APP + 30;
     static constexpr UINT navigateMessage = WM_APP + 31;
+    static constexpr UINT ctrlClickMessage = WM_APP + 32;
     int queuedTab = -1;
     bool presentQueued = false;
     bool watchingKeys = false;
     Band* nextOnThread = nullptr;
     inline static thread_local HHOOK threadKeys = nullptr;
     inline static thread_local Band* threadBands = nullptr;
+    inline static thread_local HWND ctrlDownWindow = nullptr;
+    inline static thread_local POINT ctrlDownPoint{};
     HWND incoming = nullptr;
     HWND awaitingAck = nullptr;
     LPARAM incomingBirth = 0;
@@ -917,10 +920,9 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
             !GetPropW(other,merge::fullProp) && IsWindowEnabled(merge::frame(other));
     }
     void dragFeedback(POINT p) {
+        if (pressedTab<0 || pressedTab>=static_cast<int>(folders.size())) return;
         HWND other=dropBand(p);
-        RECT r{}; GetWindowRect(bar,&r);
-        const wchar_t* hint=other ? (acceptsDrop(other)?L"松开以合并到此窗口":L"此窗口无法接收标签") :
-            PtInRect(&r,p) ? L"拖出标签栏以分离" : L"松开以分离为新窗口";
+        const auto& hint=folders[pressedTab].title;
         if (!dragging || dragText!=hint) {
             dragText=hint;
             tipTool.lpszText=dragText.data();
@@ -973,7 +975,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         RECT item{};
         bool onClose = false;
         if (index >= 0 && TabCtrl_GetItemRect(w,index,&item)) {
-            RECT box = BandTheme::closeRect(item,scale(96),true);
+            RECT box = theme.closeRect(item,scale(96),true);
             onClose = PtInRect(&box,hit.pt);
         }
         if (msg == WM_LBUTTONDOWN) {
@@ -1031,7 +1033,7 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         PWSTR name = nullptr;
         if (FAILED(SHGetNameFromIDList(folders[i].folder.get(),SIGDN_NORMALDISPLAY,&name)) || !name) return;
         tipTitle.reset(name);
-        RECT label = BandTheme::labelRect(r,scale(96),true);
+        RECT label = theme.labelRect(r,scale(96),true);
         HDC dc = GetDC(tabs);
         if (!dc) return;
         HFONT face = reinterpret_cast<HFONT>(SendMessageW(tabs,WM_GETFONT,0,0));
@@ -1123,11 +1125,79 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
         } else return false;
         return true;
     }
+    // Explorer handles the native selection first. Only the focused list item at
+    // the actual click point may open, never a previous selection on blank space.
+    void openCtrlClickedFolder(POINT point) {
+        if (!IsWindowVisible(bar) || destination>=0 || incoming || separating>=0 || queuedTab>=0 ||
+            !(settings::load().options & settings::ctrlClick)) return;
+        Com<IShellView> view;
+        Com<IFolderView2> folder;
+        HWND content=nullptr, hit=WindowFromPoint(point);
+        if (!browser.p || FAILED(browser->QueryActiveShellView(&view.p)) || !view.p ||
+            FAILED(view->GetWindow(&content)) || !content || (hit!=content && !IsChild(content,hit)) ||
+            FAILED(view->QueryInterface(IID_PPV_ARGS(&folder.p)))) return;
+        int index=-1;
+        Com<IShellItem> item;
+        SFGAOF attributes=0;
+        if (FAILED(folder->GetFocusedItem(&index)) || index<0 ||
+            FAILED(folder->GetItem(index,IID_PPV_ARGS(&item.p))) ||
+            FAILED(item->GetAttributes(SFGAO_FOLDER|SFGAO_STREAM,&attributes)) ||
+            (attributes&(SFGAO_FOLDER|SFGAO_STREAM))!=SFGAO_FOLDER) return;
+        Com<IAccessible> accessible;
+        VARIANT child{};
+        if (FAILED(AccessibleObjectFromPoint(point,&accessible.p,&child))) return;
+        bool focused=false;
+        for (int depth=0;accessible.p && depth<8;++depth) {
+            VARIANT role{},state{};
+            accessible->get_accRole(child,&role);
+            bool row=role.vt==VT_I4 && role.lVal==ROLE_SYSTEM_LISTITEM;
+            bool container=role.vt==VT_I4 && (role.lVal==ROLE_SYSTEM_LIST || role.lVal==ROLE_SYSTEM_WINDOW);
+            VariantClear(&role);
+            if (row) {
+                accessible->get_accState(child,&state);
+                focused=state.vt==VT_I4 && (state.lVal&STATE_SYSTEM_FOCUSED);
+                VariantClear(&state);
+                break;
+            }
+            if (container) break;
+            if (child.vt==VT_I4 && child.lVal!=CHILDID_SELF) { child.lVal=CHILDID_SELF; continue; }
+            Com<IDispatch> parent;
+            if (FAILED(accessible->get_accParent(&parent.p)) || !parent.p) break;
+            accessible.reset();
+            parent->QueryInterface(IID_PPV_ARGS(&accessible.p));
+        }
+        VariantClear(&child);
+        PIDLIST_ABSOLUTE raw=nullptr;
+        if (!focused || FAILED(SHGetIDListFromObject(item.p,&raw))) return;
+        Location id(raw);
+        int target=tabForOpen(id);
+        if (target>=0) select(moveTabToEnd(target));
+    }
     // Explorer translates Ctrl+W before dispatching to the folder view. Resolve
     // the owning band from the actual message window, even on a shared UI thread.
     static LRESULT CALLBACK focusedMessage(int code,WPARAM mode,LPARAM data) {
         if (code==HC_ACTION && mode==PM_REMOVE) {
             auto* msg=reinterpret_cast<MSG*>(data);
+            if (msg->message==WM_LBUTTONDOWN) {
+                ctrlDownWindow=nullptr;
+                if ((msg->wParam&(MK_CONTROL|MK_SHIFT))==MK_CONTROL && GetKeyState(VK_MENU)>=0) {
+                    ctrlDownWindow=msg->hwnd;
+                    ctrlDownPoint=msg->pt;
+                }
+            } else if (ctrlDownWindow && (msg->message==WM_MOUSEMOVE || msg->message==WM_LBUTTONUP)) {
+                if (!(msg->wParam&MK_CONTROL) || msg->wParam&MK_SHIFT ||
+                    abs(msg->pt.x-ctrlDownPoint.x)>=GetSystemMetrics(SM_CXDRAG) ||
+                    abs(msg->pt.y-ctrlDownPoint.y)>=GetSystemMetrics(SM_CYDRAG)) ctrlDownWindow=nullptr;
+                if (msg->message==WM_LBUTTONUP) {
+                    if (ctrlDownWindow==msg->hwnd && GetKeyState(VK_MENU)>=0) {
+                        HWND root=GetAncestor(msg->hwnd,GA_ROOT);
+                        HWND band=static_cast<HWND>(GetPropW(root,merge::bandProp));
+                        if (band && IsWindowVisible(band) && root==GetForegroundWindow())
+                            PostMessageW(band,ctrlClickMessage,0,MAKELPARAM(msg->pt.x,msg->pt.y));
+                    }
+                    ctrlDownWindow=nullptr;
+                }
+            }
             if ((msg->message==WM_KEYDOWN || msg->message==WM_SYSKEYDOWN) && msg->hwnd && msg->hwnd==GetFocus()) {
                 HWND root = GetAncestor(msg->hwnd,GA_ROOT);
                 HWND band = static_cast<HWND>(GetPropW(root,merge::bandProp));
@@ -1214,6 +1284,11 @@ class Band final : public IDeskBand, public IObjectWithSite, public IInputObject
                 if (msg==WM_RBUTTONUP) ClientToScreen(w,&p);
                 Com<IDeskBand> guard; self->AddRef(); guard.p=self;
                 self->tabMenu(p); return 0;
+            }
+            if (msg==ctrlClickMessage) {
+                Com<IDeskBand> guard; self->AddRef(); guard.p=self;
+                self->openCtrlClickedFolder({short(LOWORD(lp)),short(HIWORD(lp))});
+                return 0;
             }
             if (msg==navigateMessage) {
                 Com<IDeskBand> guard; self->AddRef(); guard.p=self;

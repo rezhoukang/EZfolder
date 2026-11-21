@@ -5,7 +5,7 @@
 class BandTheme {
     COLORREF background{}, surface{}, hover{}, edge{}, text{}, selectedText{};
     COLORREF closeHover{};
-    bool highContrast=false;
+    bool highContrast=false, showClose=true;
     HWND hotWindow = nullptr;
     int hotTab = -1;
     POINT hotPoint{};
@@ -178,13 +178,14 @@ public:
         DrawTextW(item.hDC,data->pszWText,-1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
         RestoreDC(item.hDC,saved);
     }
-    static RECT closeRect(RECT r, int dpi, bool hot) {
+    RECT closeRect(RECT r, int dpi, bool hot) const {
+        if (!showClose) { r.left=r.right; return r; }
         int width = MulDiv(r.right-r.left,96,dpi);
         int button = width >= 80 ? 23 : width >= 48 ? 18 : (hot && width >= 24 ? 11 : 0);
         r.left = r.right - MulDiv(button,dpi,96);
         return r;
     }
-    static RECT labelRect(RECT r, int dpi, bool hot) {
+    RECT labelRect(RECT r, int dpi, bool hot) const {
         int padding = r.right-r.left < MulDiv(48,dpi,96) ? 2 : 7;
         r.right = closeRect(r,dpi,hot).left;
         r.left += MulDiv(padding,dpi,96);
@@ -201,7 +202,9 @@ public:
         bool dark = !light && !contrast;
         COLORREF bg = dark ? RGB(0,0,0) : GetSysColor(COLOR_WINDOW);
         COLORREF nextSurface = contrast ? GetSysColor(COLOR_HIGHLIGHT) : dark ? RGB(48,48,48) : RGB(226,226,226);
-        if (!force && bg == background && nextSurface == surface) return;
+        bool nextClose=(settings::load().options & settings::showClose)!=0;
+        if (!force && bg == background && nextSurface == surface && nextClose==showClose) return;
+        showClose=nextClose;
         background = bg;
         surface = nextSurface;
         highContrast=contrast;

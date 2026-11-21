@@ -55,6 +55,10 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         source.Content = page;
         var pc = (Controls.RadioButton)page.FindName("ThisPC");
         var quick = (Controls.RadioButton)page.FindName("QuickAccess");
+        var showClose = (Controls.CheckBox)page.FindName("ShowClose");
+        var ctrlClick = (Controls.CheckBox)page.FindName("CtrlClick");
+        showClose.IsChecked=editor.ShowClose;
+        ctrlClick.IsChecked=editor.CtrlClick;
         quick.IsChecked = editor.QuickAccess;
         pc.IsChecked = quick.IsChecked != true;
         var rows=(Controls.StackPanel)page.FindName("Shortcuts");
@@ -83,9 +87,9 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         };
         editor.Changed+=refresh;
         refresh();
-        ((Controls.Button)page.FindName("Reset")).Click+=delegate { editor.Reset(); pc.IsChecked=true; };
+        ((Controls.Button)page.FindName("Reset")).Click+=delegate { editor.Reset(); pc.IsChecked=true; showClose.IsChecked=ctrlClick.IsChecked=true; };
         ((Controls.Button)page.FindName("Save")).Click += delegate {
-            if (editor.Save(this,quick.IsChecked == true)) Close();
+            if (editor.Save(this,quick.IsChecked == true,showClose.IsChecked==true,ctrlClick.IsChecked==true)) Close();
         };
         ((Controls.Button)page.FindName("Cancel")).Click += delegate { Close(); };
         ApplyTheme();
@@ -93,7 +97,7 @@ sealed class SettingsWindow : Forms.Form, Forms.IMessageFilter {
         Forms.Application.AddMessageFilter(this);
         using (var graphics = CreateGraphics())
             ClientSize = new Size(Math.Min(work.Width-20,(int)Math.Ceiling(416*graphics.DpiX/96)),
-                Math.Min(work.Height-64,(int)Math.Ceiling(526*graphics.DpiY/96)));
+                Math.Min(work.Height-64,(int)Math.Ceiling(606*graphics.DpiY/96)));
         Location = new Point(work.Left+(work.Width-Width)/2, work.Top+(work.Height-Height)/2);
         Shown += delegate { (quick.IsChecked == true ? quick : pc).Focus(FocusState.Programmatic); };
     }
@@ -152,18 +156,20 @@ static class SettingsProgram {
             var pc=new Forms.RadioButton { Text="此电脑",AutoSize=true };
             var quick=new Forms.RadioButton { Text="快速访问",AutoSize=true,Checked=editor.QuickAccess };
             pc.Checked=!quick.Checked;
+            var showClose=new Forms.CheckBox {Text="显示标签关闭按钮",AutoSize=true,Checked=editor.ShowClose};
+            var ctrlClick=new Forms.CheckBox {Text="Ctrl＋单击文件夹时在新标签中打开",AutoSize=true,Checked=editor.CtrlClick};
             var buttons=new Forms.TableLayoutPanel { AutoSize=true, ColumnCount=3, Dock=Forms.DockStyle.Fill };
             buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
             buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.AutoSize));
             buttons.ColumnStyles.Add(new Forms.ColumnStyle(Forms.SizeType.Percent,100));
             var ok=new Forms.Button {Text="确定"};
             var cancel=new Forms.Button {Text="取消",DialogResult=Forms.DialogResult.Cancel};
-            ok.Click+=delegate { if (editor.Save(form,quick.Checked)) form.Close(); };
+            ok.Click+=delegate { if (editor.Save(form,quick.Checked,showClose.Checked,ctrlClick.Checked)) form.Close(); };
             var reset=new Forms.Button { Text="重置默认值",AutoSize=true,Anchor=Forms.AnchorStyles.Right };
-            reset.Click+=delegate { editor.Reset(); pc.Checked=true; };
+            reset.Click+=delegate { editor.Reset(); pc.Checked=true; showClose.Checked=ctrlClick.Checked=true; };
             buttons.Controls.AddRange(new Forms.Control[]{ok,cancel,reset});
             var hint=new Forms.Label {Visible=false,AutoSize=true};
-            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,
+            content.Controls.AddRange(new Forms.Control[]{new Forms.Label {Text="新标签打开位置",AutoSize=true},pc,quick,showClose,ctrlClick,
                 new Forms.Label {Text="快捷键",AutoSize=true},hint});
             for (int i=0;i<ShortcutEditor.Names.Length;i++) {
                 int index=i;
