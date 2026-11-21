@@ -1,4 +1,4 @@
-﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting)
+﻿param([string]$PreviewPath,[switch]$TestHover,[switch]$TestSettings,[switch]$TestTabActions,[switch]$TestRouting,[switch]$TestNavigation)
 $ErrorActionPreference = 'Stop'
 Add-Type @'
 using System;
@@ -67,6 +67,11 @@ public static class RibbonEntryTest {
     public static int TabCount(IntPtr tabs) {
         IntPtr result;
         if(SendMessageTimeout(tabs,0x1304,IntPtr.Zero,IntPtr.Zero,2,500,out result)==IntPtr.Zero) throw new Exception("Tabs unavailable");
+        return result.ToInt32();
+    }
+    public static int SelectedTab(IntPtr tabs) {
+        IntPtr result;
+        if(SendMessageTimeout(tabs,0x130B,IntPtr.Zero,IntPtr.Zero,2,500,out result)==IntPtr.Zero) throw new Exception("Selection unavailable");
         return result.ToInt32();
     }
     public static void DeliverKey(IntPtr tabs,int vk) {
@@ -205,20 +210,67 @@ function Test-TabActions {
     $point=[RibbonEntryTest+Point]::new($r.Left+60,$r.Top+$r.Height/2)
     $child=Join-Path $folder 'Moved'
     [void][IO.Directory]::CreateDirectory($child)
-    $other=$null
-    try {
-        [RibbonEntryTest]::NewTab($bar)
-        Wait-For 'new tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
-        $window.Navigate2($folder)
-        Wait-For 'test folder in second tab' { $window.Document.Folder.Self.Path -eq $folder } | Out-Null
-        $name=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty,'Moved')
-        $item=Wait-For 'visible child folder' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,$name) }
+    $dpi=[RibbonEntryTest]::GetDpiForWindow($tabs)
+    function Select-TestTab($index) {
+        $x=[int]((132*$index+12)*$dpi/96)
+        [RibbonEntryTest]::Mouse($tabs,0x201,$x,8)
+        [RibbonEntryTest]::Mouse($tabs,0x202,$x,8)
+        Wait-For "select tab $index" { [RibbonEntryTest]::SelectedTab($tabs) -eq $index -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+    }
+    function Open-VisibleFolder($entry) {
+        $window.Document.SelectItem($entry,29)
+        $selected=[Windows.Automation.PropertyCondition]::new([Windows.Automation.SelectionItemPattern]::IsSelectedProperty,$true)
+        $type=[Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::ListItem)
+        $item=Wait-For 'selected folder in content view' { $frame.FindFirst([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.AndCondition]::new($selected,$type)) }
         $hit=$item.GetClickablePoint()
         [RibbonEntryTest]::OpenItem($root,[RibbonEntryTest+Point]::new($hit.X,$hit.Y))
-        Wait-For 'subfolder in second tab' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
-        if ([RibbonEntryTest]::TabCount($tabs) -ne 2) { throw 'Opening a subfolder created another tab.' }
-        Start-Sleep -Milliseconds 550
-        $dpi=[RibbonEntryTest]::GetDpiForWindow($tabs)
+    }
+    $other=$null
+    try {
+        # Seed Pictures using its disk path, then enter it through This PC's namespace item.
+        $pictures=[Environment]::GetFolderPath('MyPictures')
+        $computer=$shell.NameSpace(17).Self.Path
+        [RibbonEntryTest]::NewTab($bar)
+        Wait-For 'new tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        $window.Navigate2($pictures)
+        Wait-For 'Pictures disk path' { $window.Document.Folder.Self.Path -eq $pictures } | Out-Null
+        [RibbonEntryTest]::NewTab($bar)
+        Wait-For 'third tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 3 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        $window.Navigate2("shell:$computer")
+        Wait-For 'This PC view' { $window.Document.Folder.Self.Path -eq $computer } | Out-Null
+        [RibbonEntryTest]::NewTab($bar)
+        Wait-For 'fourth tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 4 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        Select-TestTab 2
+        function Open-Pictures {
+            Wait-For 'This PC ready for item selection' { $window.Document.Folder.Self.Path -eq $computer } | Out-Null
+            $entry=Wait-For "This PC entry pointing to $pictures" { $window.Document.Folder.Items() | Where-Object { $_.Path -eq $pictures } | Select-Object -First 1 }
+            Open-VisibleFolder $entry
+        }
+        Open-Pictures
+        Wait-For 'Pictures moved past This PC and the fourth tab' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 4 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 3 -and $window.Document.Folder.Self.Path -eq $pictures
+        } | Out-Null
+        [RibbonEntryTest]::Mouse($tabs,0x208,[int](276*$dpi/96),8)
+        Wait-For 'extra tab closed' { [RibbonEntryTest]::TabCount($tabs) -eq 3 } | Out-Null
+        Select-TestTab 1
+        Wait-For 'source This PC preserved before rightmost Pictures' { $window.Document.Folder.Self.Path -eq $computer } | Out-Null
+        Open-Pictures
+        Wait-For 'existing rightmost Pictures selected' {
+            [RibbonEntryTest]::TabCount($tabs) -eq 3 -and [RibbonEntryTest]::SelectedTab($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $pictures
+        } | Out-Null
+        [RibbonEntryTest]::Mouse($tabs,0x208,[int](276*$dpi/96),8)
+        Wait-For 'closing Pictures returns to This PC' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and $window.Document.Folder.Self.Path -eq $computer } | Out-Null
+        [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
+        Wait-For 'fixture tab preserved' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
+        'PASS: reopening Pictures in This PC moves the existing disk-path tab to the right and preserves This PC.'
+        [RibbonEntryTest]::NewTab($bar)
+        Wait-For 'second tab ready' { [RibbonEntryTest]::TabCount($tabs) -eq 2 -and [RibbonEntryTest]::IsWindowEnabled($tabs) } | Out-Null
+        $window.Navigate2($child)
+        Wait-For 'ordinary child ready' { $window.Document.Folder.Self.Path -eq $child } | Out-Null
+        Select-TestTab 0
+        Open-VisibleFolder ($window.Document.Folder.ParseName('Moved'))
+        Wait-For 'existing child selected' { $window.Document.Folder.Self.Path -eq $child -and [RibbonEntryTest]::SelectedTab($tabs) -eq 1 } | Out-Null
+        if ($TestNavigation) { return }
         [RibbonEntryTest]::Mouse($tabs,0x208,[int](144*$dpi/96),8)
         Wait-For 'tab closed' { [RibbonEntryTest]::TabCount($tabs) -eq 1 -and $window.Document.Folder.Self.Path -eq $folder } | Out-Null
         [RibbonEntryTest]::RestoreShortcut($root,$tabs)
@@ -457,6 +509,14 @@ try {
     $entry = [IntPtr](Wait-For 'ribbon entry' { [RibbonEntryTest]::Entry($root).ToInt64() })
     $button = [RibbonEntryTest]::GetDlgItem($entry,1)
     $initiallyShown = [RibbonEntryTest]::Shown($root)
+    if ($TestNavigation) {
+        if (!$initiallyShown) {
+            [RibbonEntryTest]::Click($button)
+            Wait-For 'navigation fixture band' { [RibbonEntryTest]::Shown($root) } | Out-Null
+        }
+        Test-TabActions
+        return
+    }
     if ($initiallyShown) { [RibbonEntryTest]::Click($button); Wait-For 'initial hide' { ![RibbonEntryTest]::Shown($root) } | Out-Null }
     Wait-For 'click target in the ribbon while tabs are hidden' { Test-Placement } | Out-Null
     if ($TestRouting) { Test-OpenWithoutReceiver }
